@@ -44,9 +44,8 @@ const (
 	capacityTypeSpot       = "spot"
 	capacityTypeOnDemand   = "on-demand"
 
-	reasonInsufficientCapacity = "InsufficientCapacityError"
-	reasonFailedScheduling     = "FailedScheduling"
-	karpenterComponent         = "karpenter"
+	reasonFailedScheduling = "FailedScheduling"
+	karpenterComponent     = "karpenter"
 
 	// karpenterBindTimeout covers a healthy launch up to binding: Karpenter's decision, the
 	// EC2 launch and node boot until the GPUs are advertised. Measured p-family boots may need
@@ -99,15 +98,13 @@ func karpenterCapacityType(tier nebulav1alpha1.CapacityType) string {
 	}
 }
 
-// refusals reads Karpenter's refusals for every pod in the cluster at once: its warnings about
-// pods, InsufficientCapacityError (EC2 had none) and FailedScheduling (no NodePool fits). EC2
-// refusing a launch shows nowhere else, since Karpenter deletes that NodeClaim without
-// recording why. The selector leaves out the kube-scheduler's FailedScheduling, which every
-// pod needing a new node gets. Karpenter rate-limits these events, so a dropped one only costs
-// the bind timeout.
+// refusals reads Karpenter's FailedScheduling for every pod in the cluster at once: one per pod
+// UID, so each attempt gets its own. The selector leaves out the kube-scheduler's, which every
+// pod needing a new node gets. A lost event only costs the bind timeout.
 //
-// Only InsufficientCapacityError is capacity. FailedScheduling is usually the pod's own spec
-// (a missing toleration, a selector no NodePool allows), so it fails the pod without blocking.
+// Every refusal fails the pod; only a capacity one (see capacityRefusal) blocks the candidate.
+// EC2's InsufficientCapacityError is on the NodeClaim, which names no pod, so the pod's own
+// message is the only per-pod signal of a shortage.
 func (karpenter) refusals(ctx context.Context, cc clusterClients) (map[types.UID]provider.InstanceState, error) {
 	evs, err := cc.kube.CoreV1().Events(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
 		FieldSelector: fields.Set{
@@ -124,18 +121,33 @@ func (karpenter) refusals(ctx context.Context, cc clusterClients) (map[types.UID
 		if !fromKarpenter(ev) {
 			continue
 		}
+		if ev.Reason != reasonFailedScheduling {
+			continue
+		}
 		uid := ev.InvolvedObject.UID
-		switch ev.Reason {
-		case reasonInsufficientCapacity:
+		switch {
+		case capacityRefusal(ev.Message):
 			out[uid] = provider.InstanceUnschedulable
-		case reasonFailedScheduling:
-			// A launch that reached EC2 had passed scheduling, so capacity wins.
-			if out[uid] != provider.InstanceUnschedulable {
-				out[uid] = provider.InstanceFailed
-			}
+		case out[uid] != provider.InstanceUnschedulable: // a later spec refusal does not undo a shortage
+			out[uid] = provider.InstanceFailed
 		}
 	}
 	return out, nil
+}
+
+// capacityPhrases are the parts of Karpenter v1's FailedScheduling message that mean no capacity
+// rather than the pod's own spec. A sold-out offering is filtered out as unavailable, so the
+// instance-type filter reports a missing "offering"; the other two are NodePool limits.
+var capacityPhrases = []string{"offering", "exceed limits", "limits have been exhausted"}
+
+// capacityRefusal reports whether a Karpenter refusal is about capacity. The wording is
+// Karpenter's, not an API, so TestCapacityRefusal pins real messages.
+//
+// Known gap, kept on purpose: when every family in a NodePool is unavailable at once,
+// Karpenter drops the pool before scheduling, so its clause, and the "offering", is missing.
+// Such a refusal fails the pod without a block, until Karpenter's unavailability marks lapse.
+func capacityRefusal(message string) bool {
+	return slices.ContainsFunc(capacityPhrases, func(p string) bool { return strings.Contains(message, p) })
 }
 
 func (karpenter) verify(_ context.Context, cc clusterClients) error {

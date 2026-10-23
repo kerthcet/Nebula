@@ -18,6 +18,7 @@ package kubernetes
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,13 +65,50 @@ func provisionRequest() provider.ProvisionRequest {
 	}
 }
 
-func karpenterEvent(reason, msg string) *corev1.Event {
+// karpenterEvent is Karpenter's FailedScheduling on the provisioned pod; name keeps several apart.
+func karpenterEvent(name, msg string) *corev1.Event {
 	return &corev1.Event{
-		ObjectMeta:     metav1.ObjectMeta{Name: "ev-" + reason, Namespace: "org-1"},
+		ObjectMeta:     metav1.ObjectMeta{Name: name, Namespace: "org-1"},
 		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: "org-1-work-1", Namespace: "org-1", UID: testUID},
-		Reason:         reason, Message: msg,
+		Type:           corev1.EventTypeWarning,
+		Reason:         reasonFailedScheduling, Message: msg,
 		Source: corev1.EventSource{Component: "karpenter"},
 	}
+}
+
+// Karpenter v1.14 FailedScheduling messages: "Failed to schedule pod, " and one reason per
+// NodePool, joined by "; ". The first two were captured from a live cluster, the requirement
+// dumps shortened; the capacity ones follow its InstanceTypeFilterError and limit wording.
+var (
+	refusalMissingToleration = refusal(
+		"no instance type met the scheduling requirements or had enough resources, "+
+			"requirements=karpenter.sh/nodepool In [saas-on-demand], resources={\"nvidia.com/gpu\":\"1\"}",
+		"did not tolerate taint (taint=hiverge.ai/workload_class=customer:NoSchedule)",
+		"incompatible requirements, key karpenter.sh/capacity-type, "+
+			"karpenter.sh/capacity-type In [on-demand] not in karpenter.sh/capacity-type In [spot]",
+		"did not tolerate taint (taint=aws.amazon.com/neuron:NoSchedule)",
+	)
+	refusalTooManyGPUs = refusal(
+		"no instance type met the scheduling requirements or had enough resources, "+
+			"requirements=karpenter.sh/nodepool In [saas-on-demand], resources={\"nvidia.com/gpu\":\"64\"}",
+		"did not tolerate taint (taint=aws.amazon.com/neuron:NoSchedule)",
+		"no instance type has enough resources, "+
+			"requirements=karpenter.sh/nodepool In [gpu], resources={\"nvidia.com/gpu\":\"64\"}",
+	)
+	refusalSoldOut = refusal(
+		"no instance type met the scheduling requirements or had enough resources, "+
+			"requirements=karpenter.sh/nodepool In [saas-on-demand], resources={\"nvidia.com/gpu\":\"1\"}",
+		"no instance type which had enough resources and the required offering met the scheduling requirements, "+
+			"requirements=karpenter.sh/nodepool In [gpu], resources={\"nvidia.com/gpu\":\"1\"}",
+	)
+	refusalPoolLimit = refusal(
+		"all available instance types exceed limits for nodepool (NodePool=gpu)",
+		"did not tolerate taint (taint=aws.amazon.com/neuron:NoSchedule)",
+	)
+)
+
+func refusal(reasons ...string) string {
+	return "Failed to schedule pod, " + strings.Join(reasons, "; ")
 }
 
 func TestProvisionBoundToWarmNode(t *testing.T) {
@@ -112,16 +150,19 @@ func TestProvisionBoundToWarmNode(t *testing.T) {
 }
 
 // Provision never waits for Karpenter: it accepts the pod unreserved, and List reports a
-// refusal on the next poll, whenever it arrives. Only EC2's InsufficientCapacityError is
-// capacity; Karpenter's FailedScheduling is the pod's spec, so it fails without blocking.
+// refusal on the next poll, whenever it arrives. Every refusal fails the pod; only one for
+// capacity reports Unschedulable, which also blocks the candidate.
 func TestListReportsKarpenterRefusal(t *testing.T) {
-	for reason, want := range map[string]provider.InstanceState{
-		reasonInsufficientCapacity: provider.InstanceUnschedulable,
-		reasonFailedScheduling:     provider.InstanceFailed,
+	for name, tc := range map[string]struct {
+		msg  string
+		want provider.InstanceState
+	}{
+		"spec":     {refusalMissingToleration, provider.InstanceFailed},
+		"capacity": {refusalSoldOut, provider.InstanceUnschedulable},
 	} {
-		t.Run(reason, func(t *testing.T) {
-			tc := newTestCluster(t, false)
-			p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
+		t.Run(name, func(t *testing.T) {
+			cl := newTestCluster(t, false)
+			p := newTestProvider(map[string]clusterClients{"eks-use1": cl.clients()})
 
 			res, err := p.Provision(context.Background(), placeholder(), provisionRequest())
 			if err != nil || res.Reserved {
@@ -130,28 +171,27 @@ func TestListReportsKarpenterRefusal(t *testing.T) {
 			if got := listState(t, p); got != provider.InstanceProvisioning {
 				t.Fatalf("before any refusal: %s, want Provisioning", got)
 			}
-			if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
-				karpenterEvent(reason, "refused"), metav1.CreateOptions{}); err != nil {
+			if _, err := cl.kube.CoreV1().Events("org-1").Create(context.Background(),
+				karpenterEvent("refusal", tc.msg), metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			if got := listState(t, p); got != want {
-				t.Fatalf("after Karpenter's %s: %s, want %s", reason, got, want)
+			if got := listState(t, p); got != tc.want {
+				t.Fatalf("after Karpenter's %s refusal: %s, want %s", name, got, tc.want)
 			}
 		})
 	}
 }
 
-// A launch that reached EC2 had passed scheduling, so an ICE outranks a FailedScheduling on
-// the same pod.
+// A pod refused for capacity stays so: a spec refusal recorded alongside does not undo the block.
 func TestListCapacityRefusalWins(t *testing.T) {
 	tc := newTestCluster(t, false)
 	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
 	if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err != nil {
 		t.Fatal(err)
 	}
-	for _, reason := range []string{reasonInsufficientCapacity, reasonFailedScheduling} {
+	for name, msg := range map[string]string{"sold-out": refusalSoldOut, "spec": refusalMissingToleration} {
 		if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
-			karpenterEvent(reason, "refused"), metav1.CreateOptions{}); err != nil {
+			karpenterEvent(name, msg), metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -169,12 +209,27 @@ func TestListSpecRefusalOutranksBindTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
-		karpenterEvent(reasonFailedScheduling, "did not tolerate taint"), metav1.CreateOptions{}); err != nil {
+		karpenterEvent("refusal", refusalMissingToleration), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	p.now = func() time.Time { return time.Now().Add(karpenterBindTimeout + time.Second) }
 	if got := listState(t, p); got != provider.InstanceFailed {
 		t.Fatalf("past the bind timeout after a FailedScheduling: %s, want Failed", got)
+	}
+}
+
+func TestCapacityRefusal(t *testing.T) {
+	for msg, want := range map[string]bool{
+		refusalMissingToleration: false,
+		refusalTooManyGPUs:       false,
+		refusalSoldOut:           true,
+		refusalPoolLimit:         true,
+		refusal("node limits have been exhausted for nodepool (NodePool=gpu)"): true,
+		refusal("no instance type has the required offering, requirements=…"):  true,
+	} {
+		if got := capacityRefusal(msg); got != want {
+			t.Errorf("capacityRefusal(%.80q…) = %v, want %v", msg, got, want)
+		}
 	}
 }
 
@@ -196,17 +251,21 @@ func TestListIgnoresWhatIsNotARefusal(t *testing.T) {
 	if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err != nil {
 		t.Fatal(err)
 	}
-	ev := karpenterEvent(reasonFailedScheduling, "0/3 nodes are available")
-	ev.Source.Component = "default-scheduler"
-	if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(), ev, metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
+	scheduler := karpenterEvent("scheduler", "0/3 nodes are available")
+	scheduler.Source.Component = "default-scheduler"
+	nominated := karpenterEvent("nominated", "Pod should schedule on: nodeclaim/gpu-abc")
+	nominated.Type, nominated.Reason = corev1.EventTypeNormal, "Nominated"
+	for _, ev := range []*corev1.Event{scheduler, nominated} {
+		if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(), ev, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if got := listState(t, p); got != provider.InstanceProvisioning {
-		t.Fatalf("with the scheduler's event: %s, want Provisioning", got)
+		t.Fatalf("with the scheduler's FailedScheduling and Karpenter's Nominated: %s, want Provisioning", got)
 	}
 
 	if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
-		karpenterEvent(reasonInsufficientCapacity, "earlier attempt"), metav1.CreateOptions{}); err != nil {
+		karpenterEvent("earlier", refusalSoldOut), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	pod, _ := tc.kube.CoreV1().Pods("org-1").Get(context.Background(), "org-1-work-1", metav1.GetOptions{})

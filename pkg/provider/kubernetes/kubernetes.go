@@ -20,9 +20,9 @@ limitations under the License.
 // pod, not to a node; several pods can share a Karpenter node.
 //
 // Capacity is found by trying. Provision creates the pod and returns at once, accepted but
-// unreserved; the poll loop settles it, reporting no capacity on the node autoscaler's refusal
-// or once the pod stays unbound past the bind timeout (see toInstance), and the cluster is
-// then blocklisted like an AWS region.
+// unreserved; the poll loop settles it. The node autoscaler's refusal fails the pod, and a
+// refusal for capacity, or a pod unbound past the bind timeout (see toInstance), is no
+// capacity: the cluster is then blocklisted like an AWS region.
 //
 // The real pod lives in the placeholder's namespace, named after the claim like every
 // provider's instance, which is what lets the host cluster itself be a target. Nebula reports
