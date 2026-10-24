@@ -574,8 +574,8 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 // ResolveRegions sends every declared region at once, so the token may name the whole set
 // and the block then covers all of it. That is honest — a multi-region create never says
 // which region was short — and a pool wanting per-region blocking declares per-region
-// pools. An empty region leaves Region nil, which per BlockScope matches only candidates
-// with no region, so the block never leaks onto region-pinned ones.
+// pools. An empty region stays empty, which per BlockScope matches only candidates with no
+// region, so the block never leaks onto region-pinned ones.
 func (p *Provider) ClassifyProvisionError(err error, accelerator, region string) provider.BlockScope {
 	// No failure, no block. ClassifyError already returns the zero scope here, but
 	// the region decoration below would repopulate it into a non-empty scope that
@@ -593,8 +593,8 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	}
 	// DenyAll already covers every region (auth fails everywhere), so narrowing it
 	// would contradict the category.
-	if region != "" && !scope.DenyAll {
-		scope.Region = &region
+	if scope.Deny == provider.DenyCandidate {
+		scope.Region = region
 	}
 	return scope
 }

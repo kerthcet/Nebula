@@ -545,8 +545,8 @@ func TestProvision_DiskAboveDefaultRefused(t *testing.T) {
 
 func TestClassifyProvisionError(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
-	denyAll := provider.BlockScope{DenyAll: true}
-	onDemand := provider.BlockScope{CapacityType: nebulav1alpha1.CapacityOnDemand}
+	denyAll := provider.BlockScope{Deny: provider.DenyAll}
+	onDemand := provider.BlockScope{Deny: provider.DenyCandidate, CapacityType: nebulav1alpha1.CapacityOnDemand}
 	tests := []struct {
 		name string
 		err  error
@@ -1158,20 +1158,20 @@ func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
 	// regions are independent pools, so without this the first regional failure would
 	// block every region the pool lists.
 	got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", "us-east")
-	if got.Region == nil || *got.Region != "us-east" {
-		t.Fatalf("expected the block confined to us-east, got Region=%v", got.Region)
+	if got.Deny != provider.DenyCandidate || got.Region != "us-east" {
+		t.Fatalf("expected a candidate block confined to us-east, got %+v", got)
 	}
 
-	// Unconstrained: no region axis was used, so Region stays nil — which per
-	// BlockScope's three-state rule matches only an empty-region candidate, and so
-	// cannot leak onto region-pinned ones.
-	if got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", ""); got.Region != nil {
-		t.Fatalf("expected nil Region for an unconstrained request, got %q", *got.Region)
+	// Unconstrained: no region axis was used, so Region stays empty — which per BlockScope
+	// matches only an empty-region candidate, and so cannot leak onto region-pinned ones.
+	if got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", ""); got.Region != "" {
+		t.Fatalf("expected an empty Region for an unconstrained request, got %q", got.Region)
 	}
 
 	// Auth fails in every region, so DenyAll must not be narrowed to one.
-	if got := p.ClassifyProvisionError(provider.ErrAuth, "H100:1", "us-east"); got.Region != nil {
-		t.Fatalf("DenyAll must not be confined to a region, got %q", *got.Region)
+	got = p.ClassifyProvisionError(provider.ErrAuth, "H100:1", "us-east")
+	if got != (provider.BlockScope{Deny: provider.DenyAll}) {
+		t.Fatalf("auth must deny the whole provider, got %+v", got)
 	}
 
 	// No error, no block. recordBlock installs any non-empty scope it is handed, so
@@ -1229,7 +1229,7 @@ func TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider(t *testing.T) {
 	// an expired workspace token has to fence the provider, or every replacement Pod retries it.
 	refused := fmt.Errorf("modal: image build: %w",
 		errors.New("rpc error: code = Unauthenticated desc = invalid token"))
-	if got := p.ClassifyProvisionError(refused, "H100:1", "us-east"); !got.DenyAll {
+	if got := p.ClassifyProvisionError(refused, "H100:1", "us-east"); got.Deny != provider.DenyAll {
 		t.Fatalf("Modal refusing our credentials must fence the provider, got %+v", got)
 	}
 }
@@ -1383,7 +1383,7 @@ func TestProvision_MintDeadlineBlocksTheCandidate(t *testing.T) {
 		t.Fatal("Provision succeeded; the sandbox has no credential")
 	}
 	scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1")
-	if scope == (provider.BlockScope{}) || scope.DenyAll {
+	if scope.Deny != provider.DenyCandidate {
 		t.Fatalf("BlockScope = %+v, want an accelerator-scoped block for a spent budget", scope)
 	}
 }

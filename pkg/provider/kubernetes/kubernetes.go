@@ -412,14 +412,11 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	if scope == (provider.BlockScope{}) {
 		return scope // block nothing; decorating it would create a block
 	}
-	r := region
-	if scope.DenyAll {
-		// DenyAll would block every region, but a 401/403 is one cluster's access entry or
-		// RBAC, not shared by the others. So block everything in this region instead.
-		anyAccelerator := ""
-		return provider.BlockScope{Accelerator: &anyAccelerator, Region: &r}
+	if scope.Deny == provider.DenyAll {
+		// A 401/403 is one cluster's access entry or RBAC, not shared by the others.
+		return provider.BlockScope{Deny: provider.DenyRegion, Region: region}
 	}
-	scope.Region = &r
+	scope.Region = region
 	return scope
 }
 

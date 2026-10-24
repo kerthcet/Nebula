@@ -617,16 +617,15 @@ func TestSweepRegions_CoversEveryPoolsPlacement(t *testing.T) {
 func TestClassifyProvisionError(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	const accel = "H100"
-	denyAll := provider.BlockScope{DenyAll: true}
-	// EC2 capacity/accelerator/quota blocks are confined to the adapter's region (an
-	// exact-match Region pointer) AND to the requested accelerator (passed in by the
-	// caller — the provider owns the whole scope). Only auth (DenyAll) ignores both.
-	region, wantAccel := testRegion, accel
+	denyAll := provider.BlockScope{Deny: provider.DenyAll}
+	// EC2 capacity/accelerator/quota blocks are confined to the adapter's region AND to the
+	// requested accelerator (passed in by the caller — the provider owns the whole scope).
+	// Only auth (DenyAll) ignores both.
 	onDemandRegional := provider.BlockScope{
-		Accelerator: &wantAccel, CapacityType: nebulav1alpha1.CapacityOnDemand, Region: &region,
+		Deny: provider.DenyCandidate, Accelerator: accel, CapacityType: nebulav1alpha1.CapacityOnDemand, Region: testRegion,
 	}
 	spotRegional := provider.BlockScope{
-		Accelerator: &wantAccel, CapacityType: nebulav1alpha1.CapacitySpot, Region: &region,
+		Deny: provider.DenyCandidate, Accelerator: accel, CapacityType: nebulav1alpha1.CapacitySpot, Region: testRegion,
 	}
 
 	// A Spot capacity failure the Client wraps with both sentinels: no-capacity

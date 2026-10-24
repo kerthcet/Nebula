@@ -140,6 +140,10 @@ func (f *fakeProvider) FindByClaim(_ context.Context, claim, _ string) (*provide
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
 func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool)      { return []string{c}, true }
 func (f *fakeProvider) ResolveRegions(declared, _ []string) []string           { return declared }
+
+// denyAll is the scope a provider-wide failure (auth) classifies to.
+var denyAll = provider.BlockScope{Deny: provider.DenyAll}
+
 func (f *fakeProvider) ClassifyProvisionError(err error, accel, region string) provider.BlockScope {
 	f.classifyErr = err
 	f.classifyAccel = accel
@@ -505,11 +509,11 @@ func TestCreatePod_UnattributableErrorFailsPodWithoutBlocklisting(t *testing.T) 
 }
 
 func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
-	accel, region := "H100", "us-east-1"
 	scope := provider.BlockScope{
-		Accelerator:  &accel,
+		Deny:         provider.DenyCandidate,
+		Accelerator:  "H100",
 		CapacityType: nebulav1alpha1.CapacitySpot,
-		Region:       &region,
+		Region:       "us-east-1",
 	}
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: scope}
 	bl := &recordingBlocklist{}
@@ -576,7 +580,7 @@ func TestCreatePod_BlocklistTTLFallsBackToDefault(t *testing.T) {
 		cluster: clusterWithTTL(0),
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
+			fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: denyAll}
 			bl := &recordingBlocklist{}
 			h := NewHandler(fp, nil, bl, tc.cluster)
 			h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base default is exact
@@ -599,7 +603,7 @@ func TestCreatePod_BlocklistTTLFallsBackToDefault(t *testing.T) {
 // is filed either. Blocking a candidate over OUR failure to read a pool would exclude
 // serviceable capacity for every tenant sharing the blocklist.
 func TestCreatePod_UnreadablePoolBlocksNothing(t *testing.T) {
-	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
+	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: denyAll}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl, &fakeCluster{err: errors.New("cache not synced")})
 
@@ -617,7 +621,7 @@ func TestCreatePod_UnreadablePoolBlocksNothing(t *testing.T) {
 // The recorded TTL is the base (the pool's, or the default) PLUS the handler's jitter, so
 // Pods failing for one scope do not re-probe the freed candidate in lockstep.
 func TestCreatePod_BlocklistTTLAddsJitter(t *testing.T) {
-	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
+	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: denyAll}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl, clusterWithTTL(30*time.Second))
 	h.jitterFn = func() time.Duration { return 20 * time.Second } // deterministic jitter
@@ -1896,7 +1900,7 @@ func TestCreatePod_ReadsPlacementFromClaim(t *testing.T) {
 func TestCreatePod_BlocklistRegionComesFromTheClaim(t *testing.T) {
 	fp := &fakeProvider{
 		provisionErr:  errors.New("no capacity"),
-		classifyScope: provider.BlockScope{DenyAll: true},
+		classifyScope: provider.BlockScope{Deny: provider.DenyAll},
 	}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl, clusterWithPlacement(nebulav1alpha1.CapacitySpot, "us-east-1"))
@@ -1989,7 +1993,7 @@ func TestCreatePod_FailsClosedWithoutClusterState(t *testing.T) {
 // error path arriving late: the candidate is blocklisted with the pool's TTL, the Pod fails
 // with the provision-failed reason, and a second tick neither re-fails nor re-blocks it.
 func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
-	scope := provider.BlockScope{Region: ptrTo("eks-use1")}
+	scope := provider.BlockScope{Deny: provider.DenyCandidate, Region: "eks-use1"}
 	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}
 	bl := &recordingBlocklist{}
 	cluster := clusterWithTTL(30 * time.Second)
@@ -2028,7 +2032,8 @@ func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
 // reports a refusal that is not capacity (Karpenter's FailedScheduling, a missing toleration),
 // which must not exclude the candidate for every other Pod.
 func TestReconcileOnce_FailedFailsPodWithoutBlock(t *testing.T) {
-	fp := &fakeProvider{provisionID: "inst-1", classifyScope: provider.BlockScope{Region: ptrTo("eks-use1")}}
+	scope := provider.BlockScope{Deny: provider.DenyCandidate, Region: "eks-use1"}
+	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl, clusterWithTTL(30*time.Second))
 	h.jitterFn = func() time.Duration { return 0 }
@@ -2073,8 +2078,6 @@ func TestReconcileOnce_ProvisioningIsNotInitializing(t *testing.T) {
 		t.Fatal("the readiness clock must not start while the instance has no capacity")
 	}
 }
-
-func ptrTo[T any](v T) *T { return &v }
 
 // NotReady shows as it is, Running with Ready=False, and counts toward the readiness deadline
 // like Pending: unusable for the whole deadline fails the Pod, before or after it was ready.

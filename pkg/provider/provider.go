@@ -494,38 +494,39 @@ type Offering struct {
 	GPUCount int32
 }
 
+// DenyPolicy is how much of a provider a failed placement excludes, from widest to narrowest.
+type DenyPolicy string
+
+const (
+	// DenyAll excludes every candidate of the provider: a credential that serves all of
+	// them stopped working. Still scoped to this one provider; it never spans providers.
+	DenyAll DenyPolicy = "All"
+	// DenyRegion excludes every accelerator and capacity type in BlockScope.Region: a
+	// failure of that region alone, such as one kubernetes cluster's access entry.
+	DenyRegion DenyPolicy = "Region"
+	// DenyCandidate excludes the failing candidate: BlockScope.Accelerator at its
+	// CapacityType in its Region, so failover can route around just what failed.
+	DenyCandidate DenyPolicy = "Candidate"
+)
+
 // BlockScope is how narrowly a failed placement is excluded, matched to what actually
-// failed. It is a MATCH PATTERN, not a value, so the pointer fields are three-state:
+// failed. The zero scope blocks nothing: it is the ONLY such signal, so every block names
+// its Deny policy, and the fields below are read only as that policy says.
 //
-//   - nil   => axis not applicable; matches only a candidate whose field is also empty
-//     (a CPU-only Pod has no accelerator, a region-simple provider no region).
-//   - &""   => wildcard: matches any value on that axis.
-//   - &"v"  => exact: only candidates equal to "v" (a failed H100 must not block A100).
-//
-// Pointers are needed because the scope is built in two places: the adapter classifies
-// from the error alone (which knows the region but not the accelerator, a property of the
-// request), and the vnode handler fills the accelerator in from the failing Pod. So
-// "unset" must be distinguishable from a deliberate wildcard. DenyAll ignores the pattern
-// fields entirely.
-//
-// Note this is the opposite sense to a value field like ProviderSpec.Regions, where empty
-// means "the default region". A candidate is resolved to concrete values before being
-// matched here, so the two never mix.
+// The scope is built in two places: the adapter classifies from the error alone (which
+// knows the region but not the accelerator, a property of the request), and the vnode
+// handler supplies the accelerator from the failing Pod.
 type BlockScope struct {
-	// Accelerator: nil => not applicable (CPU-only Pod, or DenyAll); &"" => every
-	// accelerator; &"H100:8" => that one pool. The value is the request's POOL identity
-	// (type:count), not the provider's SKU id, so a block stays confined to what ran out:
-	// an L4:8 shortage must not exclude L4:1. It also stays stable when a launch spans
-	// several interchangeable instance types. Filled in by the vnode handler, since the
-	// adapter classifies from the error alone and cannot know it.
-	Accelerator *string
-	// CapacityType empty => blocks all capacity types.
+	Deny DenyPolicy
+	// Accelerator, for DenyCandidate, is the request's POOL identity (type:count), not the
+	// provider's SKU id, so a block stays confined to what ran out: an L4:8 shortage must
+	// not exclude L4:1. Always an exact match: "" is a CPU-only Pod's, never every
+	// accelerator.
+	Accelerator string
+	// CapacityType, for DenyCandidate: empty => every capacity type.
 	CapacityType nebulav1alpha1.CapacityType
-	// Region: nil => the provider has no region axis (Modal, whose candidates carry an
-	// empty region too); &"us-east-1" => that region only, so a shortage there does not
-	// disqualify us-west-2.
-	Region *string
-	// DenyAll true => block everything on this provider (auth/quota errors), ignoring the
-	// fields above. Still scoped to this one provider; it never spans providers.
-	DenyAll bool
+	// Region, for DenyRegion and DenyCandidate: that region only, so a shortage there does
+	// not disqualify another. Exact like Accelerator: "" matches only candidates without a
+	// region, such as a Modal create spanning several, never the region-pinned ones.
+	Region string
 }

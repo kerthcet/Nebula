@@ -20,10 +20,9 @@ limitations under the License.
 //
 // It follows SkyPilot's blocklist-granularity rule: record at the exact granularity
 // that failed (a provider.BlockScope), and block a candidate only if some live
-// entry's scope MATCHES it. Empty scope fields are wildcards, so "no Spot H100 in
-// us-east-1" never disqualifies an OnDemand request, another accelerator, or another
-// region — while an auth failure (DenyAll) blocks the whole provider until its TTL
-// lapses.
+// entry's scope MATCHES it. So "no Spot H100 in us-east-1" (DenyCandidate) never
+// disqualifies an OnDemand request, another accelerator, or another region — while an
+// auth failure (DenyAll) blocks the whole provider until its TTL lapses.
 //
 // In-memory and per-process on purpose: this is a hint that bounds churn, not durable
 // state. After a restart it is empty and the next attempt re-probes the provider,
@@ -84,10 +83,11 @@ func newWithClock(c clock.Clock) *Blocklist {
 	return &Blocklist{clock: c}
 }
 
-// Record adds a block for prov at scope, lapsing after ttl. A DenyAll scope blocks the
-// whole provider; anything else is confined to its matching fields. A non-positive ttl
-// or empty provider is a no-op — defensive, so a misfire cannot install a permanent or
-// provider-less block. Recording also drops expired entries, bounding the slice.
+// Record adds a block for prov at scope, lapsing after ttl; scope.Deny says how much of the
+// provider it covers (see provider.DenyPolicy). A non-positive ttl, an empty provider or a
+// scope with no known policy is a no-op — defensive, so a misfire cannot install a
+// permanent, provider-less or unmatchable block. Recording also drops expired entries,
+// bounding the slice.
 //
 // Records COALESCE: an existing live entry with the same provider and an identical
 // scope has its expiry extended (never shortened) instead of gaining a duplicate. So
@@ -95,7 +95,7 @@ func newWithClock(c clock.Clock) *Blocklist {
 // distinct live scopes, not failure volume. Behaviour is unchanged, since Blocked/
 // BlockedUntil already used the latest covering expiry.
 func (b *Blocklist) Record(prov string, scope provider.BlockScope, ttl time.Duration) {
-	if prov == "" || ttl <= 0 {
+	if prov == "" || ttl <= 0 || !knownPolicy(scope.Deny) {
 		return
 	}
 	b.mu.Lock()
@@ -108,7 +108,7 @@ func (b *Blocklist) Record(prov string, scope provider.BlockScope, ttl time.Dura
 	// Coalesce into an existing live entry for the same scope. gcLocked has already
 	// dropped expired entries, so every entry scanned here is still live.
 	for i := range b.entries {
-		if b.entries[i].provider == prov && scopeEqual(b.entries[i].scope, scope) {
+		if b.entries[i].provider == prov && b.entries[i].scope == scope {
 			if expiresAt.After(b.entries[i].expiresAt) {
 				b.entries[i].expiresAt = expiresAt // extend; never shorten a live block
 			}
@@ -184,66 +184,28 @@ func (b *Blocklist) gcLocked(now time.Time) {
 	b.entries = kept
 }
 
-// scopeCovers reports whether scope (a recorded block) applies to candidate c. DenyAll
-// covers the whole provider; otherwise every field must match, per BlockScope's
-// three-state pointer semantics:
-//
-//   - nil   => axis not applicable: matches ONLY a candidate whose field is empty, so
-//     a CPU-only Pod or a region-simple provider blocks without widening.
-//   - &""   => wildcard: matches any value on that axis.
-//   - &"v"  => exact: matches only a candidate whose field equals "v".
-//
-// This is the match half of the granularity rule: as broad as the failure, no broader.
+// scopeCovers reports whether scope (a recorded block) applies to candidate c, per its
+// policy: the whole provider, one region, or one candidate. This is the match half of the
+// granularity rule: as broad as the failure, no broader.
 func scopeCovers(scope provider.BlockScope, c Candidate) bool {
-	if scope.DenyAll {
+	switch scope.Deny {
+	case provider.DenyAll:
+		return true
+	case provider.DenyRegion:
+		return scope.Region == c.Region
+	case provider.DenyCandidate:
+		return scope.Accelerator == c.Accelerator &&
+			(scope.CapacityType == "" || scope.CapacityType == c.CapacityType) &&
+			scope.Region == c.Region
+	default:
+		return false
+	}
+}
+
+func knownPolicy(p provider.DenyPolicy) bool {
+	switch p {
+	case provider.DenyAll, provider.DenyRegion, provider.DenyCandidate:
 		return true
 	}
-	if !ptrMatches(scope.Accelerator, c.Accelerator) {
-		return false
-	}
-	if scope.CapacityType != "" && scope.CapacityType != c.CapacityType {
-		return false
-	}
-	if !ptrMatches(scope.Region, c.Region) {
-		return false
-	}
-	return true
-}
-
-// scopeEqual reports whether two BlockScopes are the SAME block — identical along
-// every axis. It is used by Record to coalesce a repeated failure into an existing
-// entry. The *string fields are compared by VALUE, not pointer identity: two
-// independent failures for the same region allocate distinct *string pointers, so a
-// pointer-wise "==" on BlockScope would never coalesce them (and pointer fields make
-// "==" unsafe anyway). This is stricter than scopeCovers, which asks "does this block
-// COVER that candidate"; here we need exact equality so distinct scopes stay distinct
-// entries.
-func scopeEqual(a, b provider.BlockScope) bool {
-	return a.DenyAll == b.DenyAll &&
-		a.CapacityType == b.CapacityType &&
-		ptrEqual(a.Accelerator, b.Accelerator) &&
-		ptrEqual(a.Region, b.Region)
-}
-
-// ptrEqual reports whether two *string are equal by value: both nil, or both non-nil
-// pointing at equal strings. (nil and &"" are DIFFERENT — nil means "axis not
-// applicable" while &"" means "wildcard", a distinction BlockScope depends on.)
-func ptrEqual(x, y *string) bool {
-	if x == nil || y == nil {
-		return x == y // equal only if both nil
-	}
-	return *x == *y
-}
-
-// ptrMatches applies BlockScope's three-state rule to one axis: nil matches only an
-// empty candidate value (the axis is not applicable), &"" is a wildcard that matches
-// anything, and &"v" matches only the exact value.
-func ptrMatches(pattern *string, value string) bool {
-	if pattern == nil {
-		return value == ""
-	}
-	if *pattern == "" {
-		return true
-	}
-	return *pattern == value
+	return false
 }

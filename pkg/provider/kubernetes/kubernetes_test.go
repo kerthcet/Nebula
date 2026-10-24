@@ -249,12 +249,15 @@ func TestClassifyProvisionError(t *testing.T) {
 
 	spot := p.ClassifyProvisionError(provider.WithTier(nebulav1alpha1.CapacitySpot,
 		fmt.Errorf("x: %w", provider.ErrNoCapacity)), "H100:1", region)
-	if spot.CapacityType != nebulav1alpha1.CapacitySpot || *spot.Region != region || *spot.Accelerator != "H100:1" {
-		t.Errorf("spot shortage scope = %+v", spot)
+	want := provider.BlockScope{Deny: provider.DenyCandidate, Accelerator: "H100:1",
+		CapacityType: nebulav1alpha1.CapacitySpot, Region: region}
+	if spot != want {
+		t.Errorf("spot shortage scope = %+v, want %+v", spot, want)
 	}
 
+	// One cluster's access entry or RBAC, so the region (cluster) alone, never the provider.
 	auth := p.ClassifyProvisionError(classifyAPI(forbidden()), "H100:1", region)
-	if auth.DenyAll || *auth.Region != region || *auth.Accelerator != "" {
+	if auth != (provider.BlockScope{Deny: provider.DenyRegion, Region: region}) {
 		t.Errorf("auth failure must block only the cluster, got %+v", auth)
 	}
 }

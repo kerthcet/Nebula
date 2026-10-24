@@ -442,12 +442,11 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	if scope == (provider.BlockScope{}) {
 		return scope
 	}
-	// DenyAll already covers every region (auth fails everywhere), so narrowing it would
-	// contradict the category. An empty region leaves Region nil, which per BlockScope
-	// matches only candidates that carry no region either — the unconstrained pool — so
-	// the block never leaks onto region-pinned candidates.
-	if region != "" && !scope.DenyAll {
-		scope.Region = &region
+	// Confine a candidate block to the DC that failed; DenyAll (auth) fails everywhere, so it
+	// stays provider-wide. An empty region matches only candidates without one, the
+	// unconstrained pool, so the block never leaks onto region-pinned candidates.
+	if scope.Deny == provider.DenyCandidate {
+		scope.Region = region
 	}
 	return scope
 }
