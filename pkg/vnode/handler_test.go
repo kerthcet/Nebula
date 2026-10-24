@@ -63,7 +63,10 @@ type fakeProvider struct {
 	terminateErr    error
 	list            []provider.Instance
 	listErr         error
-	capabilities    provider.Capabilities
+	// listHook runs inside List, before it answers, so a test can act in the window in
+	// which the snapshot is already taken.
+	listHook     func()
+	capabilities provider.Capabilities
 	// classifyScope is what ClassifyProvisionError returns for a failure; the zero
 	// value (empty scope) means "not blocklistable". classifyAccel/classifyRegion
 	// record what the handler passed in, so a test can assert it resolved them off the

@@ -672,6 +672,9 @@ func (h *Handler) pollLoop(ctx context.Context) {
 // List always fails would otherwise strand every pod in its last status with no signal.
 func (h *Handler) reconcileOnce(ctx context.Context) {
 	log := logf.FromContext(ctx).WithName("vnode-poll").WithValues("provider", h.prov.Name())
+	h.mu.Lock()
+	listSeq := h.storeSeq
+	h.mu.Unlock()
 	instances, err := h.prov.List(ctx)
 	if err != nil {
 		log.Error(err, "provider List failed; tracked pod statuses will not advance this tick")
@@ -915,10 +918,12 @@ func statusSignature(pod *corev1.Pod) string {
 func (h *Handler) store(pod *corev1.Pod, claim, instance string, place *placement) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.storeSeq++
 	h.tracked[key(pod.Namespace, pod.Name)] = &trackedPod{
 		pod:       pod.DeepCopy(),
 		claimName: claim,
 		instance:  instance,
+		storeSeq:  h.storeSeq,
 		placement: place,
 	}
 }
