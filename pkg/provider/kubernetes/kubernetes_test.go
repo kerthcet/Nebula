@@ -63,7 +63,7 @@ func newTestProvider(clients map[string]clusterClients) *Provider {
 		}
 		all[cl.Name] = cc
 	}
-	return New(testClusters, all, testCatalog, []string{"org-id"})
+	return New(context.Background(), testClusters, all, testCatalog, []string{"org-id"})
 }
 
 // placeholder is a Pod as Nebula's webhook and placement leave it.
@@ -310,7 +310,7 @@ func TestFamiliesPerCluster(t *testing.T) {
 		{Name: "l4", Provider: "l4cloud", Region: "us-east-2", Geography: "us"},
 	}
 	tc := newTestCluster(t, true)
-	p := New(clusters, map[string]clusterClients{
+	p := New(context.Background(), clusters, map[string]clusterClients{
 		"eks-use1": {kube: kubefake.NewClientset()}, "l4": tc.clients(),
 	}, cat, nil)
 

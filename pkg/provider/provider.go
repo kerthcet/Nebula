@@ -167,6 +167,14 @@ type LogStreamer interface {
 	Logs(ctx context.Context, instanceID string) (io.ReadCloser, error)
 }
 
+// RegionAccelerators is OPTIONAL, for a provider whose regions do not all offer the same
+// accelerators. MapAccelerator answers for the provider as a whole; placement asks this per
+// region and skips one that cannot serve the request, rather than learning so from a failed
+// placement. A provider without it serves in every region what MapAccelerator says.
+type RegionAccelerators interface {
+	ServesAcceleratorIn(canonical, region string) bool
+}
+
 // Executor is the other OPTIONAL half: run one command inside a live instance, which is
 // what makes `kubectl exec` work. A backend with no way in (no agent, no SSH key) does
 // not implement it, and the virtual node answers NotFound.

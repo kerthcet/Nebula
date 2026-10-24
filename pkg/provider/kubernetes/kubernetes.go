@@ -58,7 +58,10 @@ const (
 	cleanupTimeout = 10 * time.Second
 )
 
-var _ provider.Provider = (*Provider)(nil)
+var (
+	_ provider.Provider           = (*Provider)(nil)
+	_ provider.RegionAccelerators = (*Provider)(nil)
+)
 
 type cluster struct {
 	cfg            ClusterConfig
@@ -103,12 +106,14 @@ func NewFromFile(ctx context.Context, path string, costLabels []string) (*Provid
 		}
 		clients[cl.Name] = cc
 	}
-	return New(cfg.Clusters, clients, cat, costLabels), nil
+	return New(ctx, cfg.Clusters, clients, cat, costLabels), nil
 }
 
 // New returns a Provider over already-built clients, one per cluster in clusters, which
-// must already be validated (see Config.Validate).
-func New(clusters []ClusterConfig, clients map[string]clusterClients, cat catalog.Lookup,
+// must already be validated (see Config.Validate). Each cluster keeps only the families its
+// region offers, read once here: what a region offers changes in months, and a restart
+// picks a change up.
+func New(ctx context.Context, clusters []ClusterConfig, clients map[string]clusterClients, cat catalog.Lookup,
 	costLabels []string) *Provider {
 	p := &Provider{
 		clusters:   make(map[string]cluster, len(clusters)),
@@ -118,6 +123,9 @@ func New(clusters []ClusterConfig, clients map[string]clusterClients, cat catalo
 	}
 	for _, cl := range clusters {
 		families := familiesByAccelerator(cat.Offerings(clusterCatalogs[cl.Provider]))
+		if api := clients[cl.Name].ec2; api != nil {
+			families = inRegion(ctx, cl, api, families)
+		}
 		p.clusters[cl.Region] = cluster{
 			cfg: cl, clients: clients[cl.Name], nodeAutoscaler: nodeAutoscalers[cl.nodeAutoscalerName()],
 			families: families,
@@ -154,6 +162,31 @@ func familiesByAccelerator(rows []provider.Offering) map[string][]string {
 	return out
 }
 
+// inRegion keeps the families of each accelerator that cl's region offers, dropping an
+// accelerator with none left. A failed lookup keeps them all: a cluster wrongly ruled out is
+// worse than one refused once.
+func inRegion(
+	ctx context.Context, cl ClusterConfig, api describeOfferings, byAccel map[string][]string,
+) map[string][]string {
+	var all []string
+	for _, fs := range byAccel {
+		all = append(all, fs...)
+	}
+	offered, err := offeredFamilies(ctx, api, all)
+	if err != nil {
+		logf.FromContext(ctx).Info("kubernetes: could not read the region's instance families; keeping all",
+			"cluster", cl.Name, "region", cl.Region, "error", err.Error())
+		return byAccel
+	}
+	out := make(map[string][]string, len(byAccel))
+	for accel, fs := range byAccel {
+		if kept := slices.DeleteFunc(slices.Clone(fs), func(f string) bool { return !offered[f] }); len(kept) > 0 {
+			out[accel] = kept
+		}
+	}
+	return out
+}
+
 // Name implements provider.Provider.
 func (p *Provider) Name() string { return provider.ProviderKubernetes }
 
@@ -180,6 +213,17 @@ func (p *Provider) Offerings(context.Context) ([]provider.Offering, error) { ret
 func (p *Provider) MapAccelerator(canonical string, _ int32) ([]string, bool) {
 	fs, ok := p.offered[strings.ToUpper(canonical)]
 	return slices.Clone(fs), ok
+}
+
+// ServesAcceleratorIn implements provider.RegionAccelerators: whether the cluster in region
+// has the accelerator's families, so placement skips one whose region does not offer them.
+func (p *Provider) ServesAcceleratorIn(canonical, region string) bool {
+	cl, ok := p.clusters[region]
+	if !ok {
+		return false
+	}
+	_, ok = cl.families[strings.ToUpper(canonical)]
+	return ok
 }
 
 // Provision implements provider.Provider: create the real pod in the cluster req.Region

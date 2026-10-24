@@ -176,6 +176,12 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				continue
 			}
 			for _, region := range regions { // inner: region
+				if accel != "" && !servesAcceleratorIn(prov, accel, region) {
+					metrics.RecordCandidateSkip(ref.Name, tier, region, metrics.SkipAcceleratorUnsupported)
+					log.V(1).Info("skipping candidate: region does not offer the accelerator",
+						"provider", ref.Name, "accelerator", accelerator, "region", region)
+					continue
+				}
 				if until, blocked := r.blockedUntil(ref.Name, accelerator, tier, region); blocked {
 					// Servable but failed recently; try the next region, then the next
 					// tier, and remember when this one frees so we can requeue for it.
@@ -211,6 +217,13 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 			"accelerator", util.AcceleratorPool(accel, count), "skipped", skipped)
 	}
 	return placement{}, false, soonest
+}
+
+// servesAcceleratorIn reports whether prov offers the accelerator in region, which only a
+// provider.RegionAccelerators narrows below what MapAccelerator already said.
+func servesAcceleratorIn(prov provider.Provider, accel, region string) bool {
+	ra, ok := prov.(provider.RegionAccelerators)
+	return !ok || ra.ServesAcceleratorIn(accel, region)
 }
 
 // placementLabels renders the metric label set for a completed placement. It mirrors

@@ -529,6 +529,38 @@ func TestPlacement_ExpandsRegionGroupIntoConcreteCandidates(t *testing.T) {
 	}
 }
 
+// regionalProvider offers its GPUs only in some regions, as a provider.RegionAccelerators.
+type regionalProvider struct {
+	*fakeProvider
+	servedIn map[string]bool
+}
+
+func (p regionalProvider) ServesAcceleratorIn(_, region string) bool {
+	return p.servedIn[region]
+}
+
+// A region that does not offer the accelerator is skipped up front, without a placement there
+// that fails and without a block.
+func TestPlacement_SkipsRegionWithoutTheAccelerator(t *testing.T) {
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderKubernetes, "us")
+	prov := regionalProvider{
+		fakeProvider: &fakeProvider{
+			name: provider.ProviderKubernetes, gpus: []string{"H100"},
+			expandRegions: func([]string) []string { return []string{"us-east-1", "us-west-1"} },
+		},
+		servedIn: map[string]bool{"us-west-1": true},
+	}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	reconcilePod(t, r, "default", "p1")
+
+	if region := getClaim(t, c, "default-p1").Spec.Region; region != "us-west-1" {
+		t.Fatalf("placed in %q, want us-west-1, the only region offering the accelerator", region)
+	}
+}
+
 func TestRequestedGeographies(t *testing.T) {
 	cases := []struct {
 		name  string

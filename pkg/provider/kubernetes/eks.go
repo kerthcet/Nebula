@@ -21,12 +21,15 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -58,6 +61,39 @@ const (
 // events, plus discovery to check the node autoscaler is installed.
 type clusterClients struct {
 	kube k8s.Interface
+	// ec2 answers which instance families the cluster's region offers (see offeredFamilies);
+	// nil keeps every family the catalog has.
+	ec2 describeOfferings
+}
+
+// describeOfferings is the one EC2 call used, so a test can stand in for the client.
+type describeOfferings interface {
+	DescribeInstanceTypeOfferings(context.Context, *ec2.DescribeInstanceTypeOfferingsInput,
+		...func(*ec2.Options)) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
+}
+
+// offeredFamilies returns which of families the client's region offers any instance type of.
+func offeredFamilies(ctx context.Context, api describeOfferings, families []string) (map[string]bool, error) {
+	patterns := make([]string, len(families))
+	for i, f := range families {
+		patterns[i] = f + ".*" // the family's own types only, never another family's prefix
+	}
+	found := map[string]bool{}
+	pages := ec2.NewDescribeInstanceTypeOfferingsPaginator(api, &ec2.DescribeInstanceTypeOfferingsInput{
+		LocationType: ec2types.LocationTypeRegion,
+		Filters:      []ec2types.Filter{{Name: awssdk.String("instance-type"), Values: patterns}},
+	})
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("kubernetes: describe instance type offerings: %w", err)
+		}
+		for _, off := range page.InstanceTypeOfferings {
+			family, _, _ := strings.Cut(string(off.InstanceType), ".")
+			found[family] = true
+		}
+	}
+	return found, nil
 }
 
 // newEKSClients builds the clients for one EKS cluster from Nebula's ambient AWS identity
@@ -107,7 +143,7 @@ func newEKSClients(ctx context.Context, cl ClusterConfig) (clusterClients, error
 	if err != nil {
 		return clusterClients{}, fmt.Errorf("kubernetes: cluster %q: build client: %w", cl.Name, err)
 	}
-	return clusterClients{kube: kube}, nil
+	return clusterClients{kube: kube, ec2: ec2.NewFromConfig(awsCfg)}, nil
 }
 
 // eksTokenSource mints and caches the bearer token for one cluster.
