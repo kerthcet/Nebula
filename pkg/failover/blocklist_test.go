@@ -301,12 +301,104 @@ func TestRecord_ExpiredEntriesAreGarbageCollected(t *testing.T) {
 	bl := newWithClock(fc)
 	bl.Record("aws", spotH100EastScope(), time.Minute)
 
-	// Let the first entry expire, then record another: the GC on Record should drop
-	// the stale one so the slice does not grow unbounded.
-	fc.Step(2 * time.Minute)
+	// Let the first entry expire and its probe pass unrefused, then record another: the GC
+	// on Record should drop the stale one so the slice stays bounded.
+	fc.Step(time.Minute)
+	bl.Admit(cand("aws", "H100", spot, "us-east-1"))
+	fc.Step(ProbeWindow)
 	bl.Record("aws", provider.BlockScope{Deny: provider.DenyAll}, time.Minute)
 
 	if n := len(bl.entries); n != 1 {
 		t.Fatalf("len(entries) = %d, want 1 (stale entry should be GC'd on Record)", n)
+	}
+}
+
+// A lapsed block admits ONE probe; every other caller is held back for ProbeWindow, so a
+// candidate still out costs one attempt per expiry instead of one per waiting Pod.
+func TestAdmit_HalfOpenAdmitsOneProbe(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	c := cand("aws", "H100", spot, "us-east-1")
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+
+	if until, ok := bl.Admit(c); ok || until != 30*time.Second {
+		t.Fatalf("while blocked: Admit = (%v, %v), want (30s, false)", until, ok)
+	}
+	fc.Step(30 * time.Second)
+	if _, ok := bl.Admit(c); !ok {
+		t.Fatal("the first Admit after the block lapsed must be the probe")
+	}
+	for i := 0; i < 3; i++ {
+		if until, ok := bl.Admit(c); ok || until != ProbeWindow {
+			t.Fatalf("Admit %d during the probe = (%v, %v), want (%v, false)", i, until, ok, ProbeWindow)
+		}
+	}
+	if !bl.Blocked(c) {
+		t.Error("a probing candidate must read as blocked to everyone else")
+	}
+}
+
+// A refused probe is recorded like any failure and blocks the candidate again for its TTL.
+func TestAdmit_RefusedProbeBlocksAgain(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	c := cand("aws", "H100", spot, "us-east-1")
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+	fc.Step(30 * time.Second)
+	if _, ok := bl.Admit(c); !ok {
+		t.Fatal("want the probe admitted")
+	}
+
+	fc.Step(15 * time.Second) // the node autoscaler refuses the probe
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+	if until, ok := bl.Admit(c); ok || until != 30*time.Second {
+		t.Fatalf("after the probe was refused: Admit = (%v, %v), want (30s, false)", until, ok)
+	}
+	// And the cycle repeats: one probe once that block lapses.
+	fc.Step(30 * time.Second)
+	if _, ok := bl.Admit(c); !ok {
+		t.Fatal("want the next probe admitted once the renewed block lapsed")
+	}
+}
+
+// A probe not refused within ProbeWindow was let through, so the candidate opens for all.
+func TestAdmit_UnrefusedProbeOpensTheCandidate(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	c := cand("aws", "H100", spot, "us-east-1")
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+	fc.Step(30 * time.Second)
+	bl.Admit(c)
+
+	fc.Step(ProbeWindow)
+	for i := 0; i < 3; i++ {
+		if _, ok := bl.Admit(c); !ok {
+			t.Fatalf("Admit %d after an unrefused probe = false, want the candidate open", i)
+		}
+	}
+	if n := len(bl.entries); n != 0 {
+		t.Fatalf("len(entries) = %d, want 0 once the probe window passed", n)
+	}
+}
+
+// Only Admit claims the probe: a read-only query of a half-open candidate sees it as not
+// blocked and leaves the probe for placement.
+func TestBlockedUntil_NeverAdmitsAProbe(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	c := cand("aws", "H100", spot, "us-east-1")
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+	fc.Step(30 * time.Second)
+
+	for i := 0; i < 3; i++ {
+		if until, blocked := bl.BlockedUntil(c); blocked || until != 0 {
+			t.Fatalf("BlockedUntil %d of a half-open candidate = (%v, %v), want (0, false)", i, until, blocked)
+		}
+	}
+	if _, ok := bl.Admit(c); !ok {
+		t.Fatal("the probe must still be available to Admit")
+	}
+	if _, ok := bl.Admit(cand("aws", "A100", spot, "us-east-1")); !ok {
+		t.Fatal("a candidate no entry covers is always admitted")
 	}
 }

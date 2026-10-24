@@ -276,22 +276,24 @@ func requestedGeographies(pod *corev1.Pod) (narrowTo []string, ok bool) {
 	return out, len(out) > 0
 }
 
-// blockedUntil reports whether the (provider, accelerator, tier, region)
-// candidate is currently excluded by the failover blocklist and, if so, how long
-// until it frees (for the requeue hint). accelerator is the request's pool
-// identity (type:count; see selectPlacement), so a capacity block matches only
-// candidates on the same pool. It is nil-safe: with no blocklist wired (tests, or
-// a blocklist-less build) nothing is ever blocked.
+// blockedUntil reports whether the failover blocklist holds the (provider, accelerator,
+// tier, region) candidate back and, if so, how long until it frees (for the requeue hint).
+// A false result admits the candidate, as a lapsed block's probe if it is one, so call it
+// only for the candidate about to be selected. accelerator is the request's pool identity
+// (type:count; see selectPlacement), so a capacity block matches only candidates on the
+// same pool. It is nil-safe: with no blocklist wired (tests, or a blocklist-less build)
+// nothing is ever blocked.
 func (r *PodPlacementReconciler) blockedUntil(provName, accelerator string, tier nebulav1alpha1.CapacityType, region string) (time.Duration, bool) {
 	if r.Blocklist == nil {
 		return 0, false
 	}
-	return r.Blocklist.BlockedUntil(failover.Candidate{
+	until, admitted := r.Blocklist.Admit(failover.Candidate{
 		Provider:     provName,
 		Accelerator:  accelerator,
 		CapacityType: tier,
 		Region:       region,
 	})
+	return until, !admitted
 }
 
 // requeueJitter maps a Pod UID to a stable offset in [0, blockRequeueJitter) to

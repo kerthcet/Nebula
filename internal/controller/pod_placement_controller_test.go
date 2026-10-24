@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -50,7 +51,12 @@ type fakeBlocklist struct {
 	until   time.Duration
 }
 
-func (b *fakeBlocklist) BlockedUntil(c failover.Candidate) (time.Duration, bool) {
+func (b *fakeBlocklist) Admit(c failover.Candidate) (time.Duration, bool) {
+	until, blocked := b.blockedUntil(c)
+	return until, !blocked
+}
+
+func (b *fakeBlocklist) blockedUntil(c failover.Candidate) (time.Duration, bool) {
 	for _, e := range b.blocked {
 		if e.Provider != "" && e.Provider != c.Provider {
 			continue
@@ -558,6 +564,44 @@ func TestPlacement_SkipsRegionWithoutTheAccelerator(t *testing.T) {
 
 	if region := getClaim(t, c, "default-p1").Spec.Region; region != "us-west-1" {
 		t.Fatalf("placed in %q, want us-west-1, the only region offering the accelerator", region)
+	}
+}
+
+// When a block lapses, the Pods waiting on it do not all go: the first is the probe and is
+// placed, the others stay gated and requeue, so a candidate still out costs one attempt.
+func TestPlacement_LapsedBlockAdmitsOneProbe(t *testing.T) {
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal, "us-east-1")
+	objs := make([]client.Object, 0, 6)
+	objs = append(objs, pool)
+	for i := range 5 {
+		objs = append(objs, gatedPod(fmt.Sprintf("p%d", i), "default", fmt.Sprintf("uid-%d", i), "pool-a", "H100"))
+	}
+	r, c := newPlacementReconciler(t, objs, &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}})
+	bl := failover.New()
+	bl.Record(provider.ProviderModal, provider.BlockScope{Deny: provider.DenyCandidate, Accelerator: "H100:1",
+		CapacityType: nebulav1alpha1.CapacityOnDemand, Region: "us-east-1"}, time.Millisecond)
+	time.Sleep(5 * time.Millisecond) // the block lapses: half-open
+	r.Blocklist = bl
+
+	placed := 0
+	for i := range 5 {
+		res, err := r.Reconcile(context.Background(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: "default", Name: fmt.Sprintf("p%d", i)},
+		})
+		if err != nil {
+			t.Fatalf("reconcile p%d: %v", i, err)
+		}
+		var nc nebulav1alpha1.NodeClaim
+		switch err := c.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("default-p%d", i)}, &nc); {
+		case err == nil:
+			placed++
+		case res.RequeueAfter <= 0:
+			t.Errorf("p%d was held back without a requeue", i)
+		}
+	}
+	if placed != 1 {
+		t.Fatalf("placed %d Pods against the lapsed block, want 1, the probe", placed)
 	}
 }
 
