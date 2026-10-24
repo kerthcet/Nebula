@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1148,6 +1150,29 @@ func TestResolveRegions_RoundTripsThroughProvision(t *testing.T) {
 		if !slices.Equal(f.lastSpec.Regions, want) {
 			t.Fatalf("declared %v reached Modal as %v, want %v", declared, f.lastSpec.Regions, want)
 		}
+	}
+}
+
+func TestMintTimeoutBlocksTheCandidate(t *testing.T) {
+	// Modal gives up waiting for a worker with a server-side DeadlineExceeded, not our own
+	// context deadline. Unlabelled, it read as unattributable and blocked nothing, so every
+	// replacement Pod queued behind the same full Modal for another ~3m43s.
+	p := newTestProvider(&fakeClient{})
+	timedOut := mintError("sb-1", 8080,
+		status.Error(codes.DeadlineExceeded, "Sandbox task ID not found within timeout"))
+	want := provider.BlockScope{
+		Deny: provider.DenyCandidate, Accelerator: "A100-40GB:8", CapacityType: nebulav1alpha1.CapacityOnDemand,
+	}
+	if got := p.ClassifyProvisionError(timedOut, "A100-40GB:8", ""); got != want {
+		t.Fatalf("mint timeout: got %+v, want %+v", got, want)
+	}
+
+	denied := mintError("sb-1", 8080, status.Error(codes.PermissionDenied, "token revoked"))
+	if errors.Is(denied, provider.ErrNoCapacity) {
+		t.Fatal("a mint failure other than the worker wait was labelled a shortage")
+	}
+	if got := p.ClassifyProvisionError(denied, "A100-40GB:8", ""); got.Deny != provider.DenyAll {
+		t.Fatalf("mint auth failure: got %+v, want DenyAll", got)
 	}
 }
 
