@@ -583,12 +583,11 @@ func TestCapabilities(t *testing.T) {
 	if caps.SupportsStop || caps.SupportsSpot || caps.PreemptionNotice != 0 || !caps.NativeTags {
 		t.Fatalf("unexpected caps: %+v", caps)
 	}
-	// Must be STATED, and above the handler's generic default: Provision blocks on the image
-	// build here, so this adapter needs more than a provider whose create just returns an id.
-	// Zero is the regression to guard — it silently reverts to that default.
+	// Must be STATED: Provision blocks on the build and the mint here, so this adapter needs
+	// more than the handler's generic default. Zero is the regression to guard — it silently
+	// reverts to that default.
 	if caps.ProvisionTimeout != provisionTimeout {
-		t.Fatalf("ProvisionTimeout = %v, want %v to cover a cold image build",
-			caps.ProvisionTimeout, provisionTimeout)
+		t.Fatalf("ProvisionTimeout = %v, want %v", caps.ProvisionTimeout, provisionTimeout)
 	}
 	if p.Name() != provider.ProviderModal {
 		t.Fatalf("name = %q", p.Name())
@@ -1156,7 +1155,7 @@ func TestResolveRegions_RoundTripsThroughProvision(t *testing.T) {
 func TestMintTimeoutBlocksTheCandidate(t *testing.T) {
 	// Modal gives up waiting for a worker with a server-side DeadlineExceeded, not our own
 	// context deadline. Unlabelled, it read as unattributable and blocked nothing, so every
-	// replacement Pod queued behind the same full Modal for another ~3m43s.
+	// replacement Pod queued behind the same full Modal again.
 	p := newTestProvider(&fakeClient{})
 	timedOut := mintError("sb-1", 8080,
 		status.Error(codes.DeadlineExceeded, "Sandbox task ID not found within timeout"))

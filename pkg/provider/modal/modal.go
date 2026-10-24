@@ -70,16 +70,12 @@ import (
 // different ceiling sets spec.activeDeadlineSeconds, which maps straight through.
 const defaultSandboxTimeout = 24 * time.Hour
 
-// provisionTimeout raises the vnode handler's generic Provision deadline, because Provision here
-// BLOCKS twice: a cold image is pulled into Modal's cache on this call (see sdkClient.buildImage),
-// and the credential mint then waits for a worker (see sdkClient.mintCredential).
-//
-// The two legs SHARE this budget, and the mint is the greedy one: Modal caps it at ~3m43s of its
-// own accord, so it always fails before this deadline does and the build is left roughly the
-// remaining minute. That is the cost of a tight ceiling here — a cold pull of a large image can
-// outrun it — and it is deliberate: a call that will die at 3m43s anyway should not hold a
-// pod-controller worker for ten minutes first.
-const provisionTimeout = 5 * time.Minute
+// provisionTimeout bounds Provision, which blocks on the image build and then on the mint's wait
+// for a worker (see sdkClient.mintCredential). A minute, well under Modal's own ~3m43s cap on
+// the mint, on purpose: Modal is a fallback, so a queued GPU is a shortage to fail over from
+// rather than wait in. Its cost is the queued sandboxes that would have been placed later
+// (measured 89s to ~220s), and a cold build of a large image that outruns it.
+const provisionTimeout = time.Minute
 
 // compile-time assertions that Provider satisfies the interfaces. LogStreamer and
 // Executor are the optional halves: they are what make `kubectl logs` and `kubectl exec`
@@ -446,8 +442,8 @@ func (p *Provider) Capabilities() provider.Capabilities {
 //
 // A fresh sandbox comes back RESERVED, but not because Modal's create says so — it accepts a
 // sandbox whose GPU is still queued. The mint is what waits (see mintCredential), so id and
-// capacity arrive together, at the price of a call that blocks for as long as the queue does —
-// bounded by Modal's own ~3m43s cap on the mint, not by provisionTimeout.
+// capacity arrive together, at the price of a call that blocks for as long as the queue does,
+// up to provisionTimeout.
 //
 // The connect credential comes back on this call and only this call, since Modal mints it
 // once with no read-back, and only for a Pod that declares a containerPort. The caller must
