@@ -622,7 +622,9 @@ func toState(pod *corev1.Pod) provider.InstanceState {
 	switch pod.Status.Phase {
 	case corev1.PodRunning:
 		// Running only says the containers started; Ready is what makes the workload available.
-		if podReady(pod) {
+		// A terminating pod is not available whatever its Ready says: it can read True through
+		// the whole grace period while its own cluster already routes nothing to it.
+		if podReady(pod) && pod.DeletionTimestamp == nil {
 			return provider.InstanceRunning
 		}
 		return provider.InstanceNotReady

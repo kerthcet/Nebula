@@ -424,7 +424,13 @@ func TestToStateNeedsReady(t *testing.T) {
 		"ready":            {running(corev1.ConditionTrue), provider.InstanceRunning},
 		"probe failing":    {running(corev1.ConditionFalse), provider.InstanceNotReady},
 		"no condition yet": {running(""), provider.InstanceNotReady},
-		"unbound":          {&corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}, provider.InstanceProvisioning},
+		"terminating, still ready": {func() *corev1.Pod {
+			pod := running(corev1.ConditionTrue)
+			now := metav1.Now()
+			pod.DeletionTimestamp = &now
+			return pod
+		}(), provider.InstanceNotReady},
+		"unbound": {&corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}, provider.InstanceProvisioning},
 		"bound, starting": {&corev1.Pod{
 			Spec: corev1.PodSpec{NodeName: "node-1"}, Status: corev1.PodStatus{Phase: corev1.PodPending},
 		}, provider.InstancePending},
