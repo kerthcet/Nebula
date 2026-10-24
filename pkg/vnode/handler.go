@@ -117,6 +117,11 @@ type Handler struct {
 	// provision is wrong and unrecoverable.
 	tracked map[string]*trackedPod
 
+	// storeSeq numbers stores into tracked, only so a poll tick can tell which pods were
+	// stored after its List began: such a pod can be missing from that List while alive,
+	// so the List is no verdict on it (see reconcileOnce).
+	storeSeq uint64
+
 	notify func(*corev1.Pod)
 
 	// nowFn, pollEvery and readyDeadline are seams for tests. readyDeadline is
@@ -137,6 +142,7 @@ type trackedPod struct {
 	pod       *corev1.Pod
 	claimName string
 	instance  string
+	storeSeq  uint64 // see Handler.storeSeq
 	// patchedMeta is what VK has already patched onto the Pod in the API server. notify
 	// fires every poll tick for the pod's whole life, and the pod it hands us is our own
 	// stamped copy — which always carries these values, so it cannot say whether they ever
@@ -690,6 +696,8 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 		// No reverse for a terminal or deleting pod.
 		case util.Finished(tp.pod.Status.Phase) || !tp.pod.DeletionTimestamp.IsZero():
 			finished++
+		case !present && tp.storeSeq > listSeq:
+			// Stored while List was in flight; the next tick decides.
 		case !present:
 			gone++
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())

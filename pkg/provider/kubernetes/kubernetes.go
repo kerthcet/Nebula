@@ -425,8 +425,6 @@ func (p *Provider) listPods(ctx context.Context, cl cluster, fieldSelector strin
 	list, err := cl.clients.kube.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.Set(ownerLabels()).String(),
 		FieldSelector: fieldSelector,
-		// Served from the API server's watch cache rather than etcd.
-		ResourceVersion: "0",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kubernetes: list pods in cluster %q: %w", cl.cfg.Name, classifyAPI(err))

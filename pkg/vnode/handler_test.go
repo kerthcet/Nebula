@@ -124,7 +124,11 @@ func (f *fakeProvider) Get(context.Context, string, string) (*provider.Instance,
 	return nil, nil
 }
 func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
-	return f.list, f.listErr
+	list, err := f.list, f.listErr
+	if f.listHook != nil {
+		f.listHook()
+	}
+	return list, err
 }
 func (f *fakeProvider) FindByClaim(_ context.Context, claim, _ string) (*provider.Instance, error) {
 	if f.listErr != nil {
@@ -1505,6 +1509,30 @@ func TestReconcileOnce_AbsentInstanceIsTerminated(t *testing.T) {
 	}
 	if got.Status.Reason != "Terminated" {
 		t.Fatalf("expected Terminated reason, got %q", got.Status.Reason)
+	}
+}
+
+func TestReconcileOnce_PodStoredDuringListIsNotGone(t *testing.T) {
+	// The race seen live: a pod provisioned while List was in flight is missing from that
+	// snapshot, yet alive. Only a List begun after it was stored is a verdict on it.
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil, openCluster())
+	fp.listHook = func() {
+		fp.listHook = nil
+		_ = h.CreatePod(context.Background(), testPod("default", "p1"))
+	}
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase == corev1.PodFailed {
+		t.Fatalf("a pod stored during List was failed as gone: %q", got.Status.Reason)
+	}
+
+	h.reconcileOnce(context.Background()) // begun after the store, and still missing it
+	got, _ = h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodFailed || got.Status.Reason != "Terminated" {
+		t.Fatalf("phase/reason = %q/%q, want Failed/Terminated once a later List misses it",
+			got.Status.Phase, got.Status.Reason)
 	}
 }
 
