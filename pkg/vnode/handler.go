@@ -327,14 +327,14 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Deliberately NOT stored: tracking a pod makes GetPod return non-nil, which suppresses
 	// the retry this branch wants. (The provision-failure branch below stores for exactly
 	// that reason — it does not want one.)
-	env, secrets, err := resolveEnv(ctx, h.client, pod)
+	env, err := resolveEnv(ctx, h.client, pod)
 	if err != nil {
 		log.Error(err, "cannot resolve the Pod's environment; nothing provisioned, retrying")
 		h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
 		h.emit(pod)
 		return err
 	}
-	req.Env = provider.Env{Config: env, Secrets: secrets}
+	req.Env = env
 
 	// Same resolve-before-requesting rule, and the same non-terminal treatment, for the
 	// image pull credential: an imagePullSecret names a Secret in the Pod's namespace that

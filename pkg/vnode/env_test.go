@@ -29,8 +29,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
-
-	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
 // envPod is a Pod whose single container carries the given env sources.
@@ -429,14 +427,14 @@ func TestResolveEnv_NoEnvIsNil(t *testing.T) {
 	}
 }
 
-// resolveAll is resolveEnv with its two maps merged, for tests about which value wins rather
+// resolveAll is resolveEnv with its two parts merged, for tests about which value wins rather
 // than where it lands.
 func resolveAll(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod) (map[string]string, error) {
-	env, secrets, err := resolveEnv(ctx, client, pod)
+	env, err := resolveEnv(ctx, client, pod)
 	if err != nil {
 		return nil, err
 	}
-	return provider.Env{Config: env, Secrets: secrets}.All(), nil
+	return env.All(), nil
 }
 
 // A variable is a secret when the value that WON came from a Secret, so precedence decides
@@ -459,13 +457,13 @@ func TestResolveEnv_SplitsSecrets(t *testing.T) {
 		},
 	)
 
-	env, secrets, err := resolveEnv(context.Background(), client, pod)
+	env, err := resolveEnv(context.Background(), client, pod)
 	if err != nil {
 		t.Fatalf("resolveEnv: %v", err)
 	}
-	wantEnv := map[string]string{"FROM_CM": "c", "SECRET_THEN_LITERAL": "plain"}
+	wantConfig := map[string]string{"FROM_CM": "c", "SECRET_THEN_LITERAL": "plain"}
 	wantSecrets := map[string]string{"FROM_SECRET": "s", "CM_THEN_SECRET": "s"}
-	if !maps.Equal(env, wantEnv) || !maps.Equal(secrets, wantSecrets) {
-		t.Fatalf("env = %v, secrets = %v; want %v and %v", env, secrets, wantEnv, wantSecrets)
+	if !maps.Equal(env.Config, wantConfig) || !maps.Equal(env.Secrets, wantSecrets) {
+		t.Fatalf("config = %v, secrets = %v; want %v and %v", env.Config, env.Secrets, wantConfig, wantSecrets)
 	}
 }

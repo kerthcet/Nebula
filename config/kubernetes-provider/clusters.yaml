@@ -8,5 +8,4 @@ clusters:
     provider: eks
     region: us-east-1          # the EKS cluster's AWS region
     geography: us              # set explicitly; a NodePool's regions match either this or region
-    # roleARN: arn:aws:iam::123456789012:role/nebula-remote   # only for another account
     # nodeAutoscaler: karpenter   # what adds nodes; the default and only one supported today

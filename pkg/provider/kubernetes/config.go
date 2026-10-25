@@ -54,8 +54,6 @@ type ClusterConfig struct {
 	Region string `json:"region"`
 	// Geography is the Nebula geography the cluster counts as in (see provider.Geographies).
 	Geography string `json:"geography"`
-	// RoleARN, when set, is assumed before talking to this cluster: the cross-account path.
-	RoleARN string `json:"roleARN,omitempty"`
 	// NodeAutoscaler is what adds nodes to the cluster (see nodeAutoscalers). Empty is Karpenter.
 	NodeAutoscaler string `json:"nodeAutoscaler,omitempty"`
 }

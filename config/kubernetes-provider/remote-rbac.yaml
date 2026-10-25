@@ -1,9 +1,6 @@
-# What Nebula may do in a target cluster, the host cluster included. Apply it in every
-# target cluster, and map Nebula's IAM identity to the "nebula" group with an EKS access
-# entry:
-#
-#   aws eks create-access-entry --cluster-name <cluster> \
-#     --principal-arn <Nebula's IAM user or role ARN> --kubernetes-groups nebula
+# What Nebula may do in a target cluster, the host cluster included. Apply it in every target
+# cluster, and map the identity Nebula authenticates to that cluster with into the "nebula"
+# group, the way the cluster's provider maps identities to Kubernetes groups.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

@@ -27,7 +27,6 @@ import (
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
@@ -96,17 +95,14 @@ func offeredFamilies(ctx context.Context, api describeOfferings, families []stri
 	return found, nil
 }
 
-// newEKSClients builds the clients for one EKS cluster from Nebula's ambient AWS identity
-// (the SDK's default chain: an access key today, Pod Identity later). Nothing is stored:
-// the endpoint and CA come from DescribeCluster, the bearer token from STS.
+// newEKSClients builds the clients for one EKS cluster from Nebula's ambient AWS identity (the
+// SDK's default chain, the controller's IRSA role in a deployment), which must be in the
+// cluster's account: EKS has no resource policy to grant DescribeCluster across accounts.
+// Nothing is stored: the endpoint and CA come from DescribeCluster, the bearer token from STS.
 func newEKSClients(ctx context.Context, cl ClusterConfig) (clusterClients, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cl.Region))
 	if err != nil {
 		return clusterClients{}, fmt.Errorf("kubernetes: cluster %q: load AWS config: %w", cl.Name, err)
-	}
-	if cl.RoleARN != "" {
-		awsCfg.Credentials = awssdk.NewCredentialsCache(
-			stscreds.NewAssumeRoleProvider(sts.NewFromConfig(awsCfg), cl.RoleARN))
 	}
 
 	out, err := eks.NewFromConfig(awsCfg).DescribeCluster(ctx,
