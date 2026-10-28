@@ -217,6 +217,12 @@ func (f *fakeEC2) DescribeInstanceStatus(
 	return page, nil
 }
 
+func (f *fakeEC2) DescribeInstanceTypes(
+	context.Context, *ec2.DescribeInstanceTypesInput, ...func(*ec2.Options),
+) (*ec2.DescribeInstanceTypesOutput, error) {
+	return &ec2.DescribeInstanceTypesOutput{}, nil
+}
+
 func (f *fakeEC2) DescribeInstanceTypeOfferings(
 	_ context.Context, in *ec2.DescribeInstanceTypeOfferingsInput, _ ...func(*ec2.Options),
 ) (*ec2.DescribeInstanceTypeOfferingsOutput, error) {

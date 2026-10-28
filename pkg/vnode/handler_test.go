@@ -2060,8 +2060,8 @@ func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
 }
 
 // A Failed instance fails the Pod without blocking the candidate: that is how a provider
-// reports a refusal that is not capacity (Karpenter's FailedScheduling, a missing toleration),
-// which must not exclude the candidate for every other Pod.
+// reports a failure that is not capacity (a pod that cannot start), which must not exclude the
+// candidate for every other Pod.
 func TestReconcileOnce_FailedFailsPodWithoutBlock(t *testing.T) {
 	scope := provider.BlockScope{Deny: provider.DenyCandidate, Region: "eks-use1"}
 	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}

@@ -33,6 +33,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -47,10 +48,22 @@ var testCatalog = fakeCatalog{rows: []provider.Offering{
 	{AcceleratorType: "L4", AcceleratorID: "gr6.4xlarge", GPUCount: 1},
 }}
 
+var testNodesConfig = &NodesConfig{InstanceProfile: "nebula-node"}
+
 var testClusters = []ClusterConfig{
-	{Name: "eks-use1", Provider: ClusterProviderEKS, Region: "us-east-1", Geography: "us"},
-	{Name: "eks-eun1", Provider: ClusterProviderEKS, Region: "eu-north-1", Geography: "eu"},
-	{Name: "eks-usw2", Provider: ClusterProviderEKS, Region: "us-west-2", Geography: "us"},
+	{Name: "eks-use1", Provider: ClusterProviderEKS, Region: "us-east-1", Geography: "us", Nodes: testNodesConfig},
+	{Name: "eks-eun1", Provider: ClusterProviderEKS, Region: "eu-north-1", Geography: "eu", Nodes: testNodesConfig},
+	{Name: "eks-usw2", Provider: ClusterProviderEKS, Region: "us-west-2", Geography: "us", Nodes: testNodesConfig},
+}
+
+// testNodes is a cluster's nodes over a fake EC2 that launches whatever it is asked to.
+func testNodes() *managedNodes {
+	return &managedNodes{
+		ec2:     &fakeLauncher{},
+		join:    joinConfig{cluster: "c", endpoint: "https://api", ca: "Q0E=", serviceCIDR: "172.20.0.0/16"},
+		image:   aws.Image{ID: "ami-1"},
+		subnets: []aws.Subnet{{ID: "subnet-a", AZ: "us-east-1a"}},
+	}
 }
 
 // newTestProvider fills any cluster clients leaves out with an empty fake one.
@@ -59,7 +72,7 @@ func newTestProvider(clients map[string]clusterClients) *Provider {
 	for _, cl := range testClusters {
 		cc, ok := clients[cl.Name]
 		if !ok {
-			cc = clusterClients{kube: kubefake.NewClientset()}
+			cc = clusterClients{kube: kubefake.NewClientset(), nodes: testNodes()}
 		}
 		all[cl.Name] = cc
 	}
@@ -98,7 +111,7 @@ func placeholder() *corev1.Pod {
 }
 
 func TestConfigValidate(t *testing.T) {
-	ok := ClusterConfig{Name: "a", Provider: "eks", Region: "us-east-1", Geography: "us"}
+	ok := ClusterConfig{Name: "a", Provider: "eks", Region: "us-east-1", Geography: "us", Nodes: testNodesConfig}
 	cases := map[string]struct {
 		clusters []ClusterConfig
 		wantErr  string
@@ -112,18 +125,16 @@ func TestConfigValidate(t *testing.T) {
 		},
 		"missing": {clusters: []ClusterConfig{{Name: "a", Provider: "eks"}}, wantErr: "required"},
 		"region twice": {
-			clusters: []ClusterConfig{ok, {Name: "b", Provider: "eks", Region: "us-east-1", Geography: "us"}},
-			wantErr:  "a region holds one cluster",
+			clusters: []ClusterConfig{ok, {
+				Name: "b", Provider: "eks", Region: "us-east-1", Geography: "us", Nodes: testNodesConfig,
+			}},
+			wantErr: "a region holds one cluster",
 		},
 		"geography": {
-			clusters: []ClusterConfig{{Name: "a", Provider: "eks", Region: "us-east-1", Geography: "usa"}},
-			wantErr:  "geography",
-		},
-		"node autoscaler": {
 			clusters: []ClusterConfig{{
-				Name: "a", Provider: "eks", Region: "r", Geography: "us", NodeAutoscaler: "ca",
+				Name: "a", Provider: "eks", Region: "us-east-1", Geography: "usa", Nodes: testNodesConfig,
 			}},
-			wantErr: "unsupported node autoscaler",
+			wantErr: "geography",
 		},
 	}
 	for name, tc := range cases {
@@ -153,7 +164,7 @@ func TestEnvSecretName(t *testing.T) {
 func TestBuildPod(t *testing.T) {
 	got := buildPod(placeholder(), podSpec{
 		claim:      "org-1-work-1",
-		selection:  karpenter{}.selection([]string{"p5"}, nebulav1alpha1.CapacitySpot),
+		selection:  testNodes().selection("node-1"),
 		costLabels: []string{"org-id"},
 		env:        map[string]string{"B": "2", "A": "1"},
 		hasSecrets: true,
@@ -175,9 +186,6 @@ func TestBuildPod(t *testing.T) {
 	if got.Spec.NodeName != "" || len(got.Spec.NodeSelector) > 0 || len(got.Spec.Volumes) > 0 {
 		t.Errorf("Nebula scheduling or volumes leaked: %+v", got.Spec)
 	}
-	if got.Annotations[doNotDisruptAnnotation] != "true" {
-		t.Errorf("annotations = %v", got.Annotations)
-	}
 	c := got.Spec.Containers[0]
 	if len(c.EnvFrom) != 1 || c.EnvFrom[0].SecretRef.Name != "org-1-work-1-env" {
 		t.Errorf("envFrom = %+v, want the env Secret", c.EnvFrom)
@@ -190,29 +198,29 @@ func TestBuildPod(t *testing.T) {
 		t.Error("with no Secrets there is no env Secret to load")
 	}
 	terms := got.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
-	reqs := terms[0].MatchExpressions
-	want := map[string]string{instanceFamilyLabel: "p5", capacityTypeLabel: capacityTypeSpot}
-	for _, r := range reqs {
-		if want[r.Key] != strings.Join(r.Values, ",") {
-			t.Errorf("affinity %s = %v", r.Key, r.Values)
-		}
-		delete(want, r.Key)
-	}
-	if len(want) > 0 {
-		t.Errorf("missing affinity %v", want)
+	if len(terms) != 1 || len(terms[0].MatchFields) != 1 || terms[0].MatchFields[0].Values[0] != "node-1" {
+		t.Errorf("affinity = %+v, want the pin to node-1", terms)
 	}
 }
 
 func TestMapAccelerator(t *testing.T) {
 	p := newTestProvider(nil)
-	if got, ok := p.MapAccelerator("h100", 8); !ok || !slices.Equal(got, []string{"p5"}) {
-		t.Errorf("H100 = %v, %v", got, ok)
-	}
-	if got, ok := p.MapAccelerator("L4", 1); !ok || !slices.Equal(got, []string{"g6", "gr6"}) {
-		t.Errorf("L4 = %v, %v", got, ok)
-	}
-	if _, ok := p.MapAccelerator("TPU", 1); ok {
-		t.Error("TPU should be unsupported")
+	// Each pod gets a node of its own size, so the count picks the instance type.
+	for _, tc := range []struct {
+		accel string
+		count int32
+		want  []string
+	}{
+		{"h100", 8, []string{"p5.48xlarge"}},
+		{"H100", 1, []string{"p5.4xlarge"}},
+		{"L4", 1, []string{"g6.xlarge", "gr6.4xlarge"}},
+		{"H100", 3, nil},
+		{"TPU", 1, nil},
+	} {
+		got, ok := p.MapAccelerator(tc.accel, tc.count)
+		if !slices.Equal(got, tc.want) || ok != (tc.want != nil) {
+			t.Errorf("MapAccelerator(%s, %d) = %v, %v; want %v", tc.accel, tc.count, got, ok, tc.want)
+		}
 	}
 }
 
@@ -311,10 +319,10 @@ func TestFamiliesPerCluster(t *testing.T) {
 	}
 	tc := newTestCluster(t, true)
 	p := New(context.Background(), clusters, map[string]clusterClients{
-		"eks-use1": {kube: kubefake.NewClientset()}, "l4": tc.clients(),
+		"eks-use1": {kube: kubefake.NewClientset(), nodes: testNodes()}, "l4": tc.clients(),
 	}, cat, nil)
 
-	if fs, ok := p.MapAccelerator("H100", 1); !ok || !slices.Equal(fs, []string{"p5"}) {
+	if fs, ok := p.MapAccelerator("H100", 8); !ok || !slices.Equal(fs, []string{"p5.48xlarge"}) {
 		t.Fatalf("MapAccelerator(H100) = %v, %v; the provider offers what any cluster has", fs, ok)
 	}
 	req := provider.ProvisionRequest{ClaimName: "org-1-work-1", Region: "us-east-2"}
@@ -350,7 +358,7 @@ func TestBuildPodCopiesThenOverrides(t *testing.T) {
 	}}
 
 	got := buildPod(local, podSpec{
-		claim: "org-1-work-1", selection: karpenter{}.selection([]string{"p5"}, nebulav1alpha1.CapacityOnDemand),
+		claim: "org-1-work-1", selection: testNodes().selection("node-1"),
 	})
 	spec, c := got.Spec, got.Spec.Containers[0]
 
@@ -377,13 +385,11 @@ func TestBuildPodCopiesThenOverrides(t *testing.T) {
 		!slices.Contains(keys, string(util.NvidiaGPUResource)) {
 		t.Errorf("tolerations = %v; want the user's and the GPU's, not the virtual node's", keys)
 	}
-	// Both of the user's ORed terms must also carry the instance family, or one of them
-	// would let the pod land on any node.
+	// Both of the user's ORed terms must also carry the node pin, or one of them would let the
+	// pod land on any node.
 	for i, term := range spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
-		if !slices.ContainsFunc(term.MatchExpressions, func(r corev1.NodeSelectorRequirement) bool {
-			return r.Key == instanceFamilyLabel
-		}) {
-			t.Errorf("term %d lacks the instance family: %v", i, term.MatchExpressions)
+		if len(term.MatchFields) != 1 || term.MatchFields[0].Values[0] != "node-1" {
+			t.Errorf("term %d lacks the node pin: %+v", i, term)
 		}
 	}
 	if local.Spec.NodeName != "nebula-kubernetes" || len(local.Spec.Tolerations) != 2 {
@@ -430,7 +436,7 @@ func TestToStateNeedsReady(t *testing.T) {
 			pod.DeletionTimestamp = &now
 			return pod
 		}(), provider.InstanceNotReady},
-		"unbound": {&corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}, provider.InstanceProvisioning},
+		"waiting for its node": {&corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}, provider.InstancePending},
 		"bound, starting": {&corev1.Pod{
 			Spec: corev1.PodSpec{NodeName: "node-1"}, Status: corev1.PodStatus{Phase: corev1.PodPending},
 		}, provider.InstancePending},

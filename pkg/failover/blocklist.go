@@ -47,10 +47,9 @@ import (
 )
 
 // ProbeWindow is how long a half-open candidate's one probe has to be refused before the
-// candidate opens for everyone. Long enough for most refusals: a synchronous provider's
-// (AWS, Modal) fails Provision itself, and Karpenter's arrives within ~3-8s, poll included,
-// while it still remembers the shortage. One that rechecks EC2 can take ~30s; such a late
-// refusal only lets the waiting Pods in as before, never worse.
+// candidate opens for everyone. Long enough for most refusals, since every provider fails
+// Provision itself on a shortage. One slower than this (a Modal mint waiting out its budget)
+// only lets the waiting Pods in as before, never worse.
 const ProbeWindow = 15 * time.Second
 
 // entry is one recorded block: the provider it applies to, the scope that failed, when the

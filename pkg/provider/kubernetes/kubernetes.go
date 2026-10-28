@@ -14,19 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package kubernetes implements provider.Provider on EKS clusters running Karpenter. Each
-// cluster is one region: placement picks a cluster, this adapter creates the real pod there,
-// and that cluster's Karpenter launches and packs the nodes. One NodeClaim maps to one real
-// pod, not to a node; several pods can share a Karpenter node.
+// Package kubernetes implements provider.Provider on EKS clusters. Each cluster is one region:
+// placement picks a cluster, and this adapter launches the real pod's own node there (see
+// managedNodes), then creates the pod pinned to it. One NodeClaim maps to one real pod and one
+// node, which goes with the pod.
 //
-// Capacity is found by trying. Provision creates the pod and returns at once, accepted but
-// unreserved; the poll loop settles it. The node autoscaler's refusal fails the pod, and a
-// refusal for capacity, or a pod unbound past the bind timeout (see toInstance), is no
-// capacity: the cluster is then blocklisted like an AWS region.
+// Capacity is EC2's answer to the launch, so a shortage fails Provision itself and the cluster
+// is blocklisted like an AWS region; past the launch, the pod waits only for its node to boot.
 //
 // The real pod lives in the placeholder's namespace, named after the claim like every
 // provider's instance, which is what lets the host cluster itself be a target. Nebula reports
-// no cost for it: a shared node has no per-pod price here, and OpenCost covers the clusters.
+// no cost for it: OpenCost covers the clusters.
 package kubernetes
 
 import (
@@ -42,10 +40,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 	"github.com/InftyAI/Nebula/pkg/util"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -64,23 +62,24 @@ var (
 )
 
 type cluster struct {
-	cfg            ClusterConfig
-	clients        clusterClients
-	nodeAutoscaler nodeAutoscaler
+	cfg     ClusterConfig
+	clients clusterClients
 	// families maps a canonical accelerator to the instance families carrying it in this
 	// cluster's cloud (see clusterCatalogs).
 	families map[string][]string
+	// nodeTypes sizes the cluster's nodes (see nodeInstanceTypes).
+	nodeTypes map[string][]string
 }
 
 // Provider is the kubernetes implementation of provider.Provider.
 type Provider struct {
 	clusters map[string]cluster // by region, the token placement and blocks carry
 	order    []string           // config order, which is the order ResolveRegions walks
-	// offered is every cluster's families merged, for MapAccelerator: placement asks the
+	// offered is every cluster's nodeTypes merged, for MapAccelerator: placement asks the
 	// provider, not a cluster, whether it serves an accelerator.
 	offered    map[string][]string
 	costLabels []string
-	now        func() time.Time // a seam for the bind timeout in toInstance
+	now        func() time.Time // a seam for the node sweep
 }
 
 // NewFromFile builds the provider from the cluster table at path, connecting to every
@@ -100,9 +99,6 @@ func NewFromFile(ctx context.Context, path string, costLabels []string) (*Provid
 		cc, err := newEKSClients(ctx, cl)
 		if err != nil {
 			return nil, err
-		}
-		if err := nodeAutoscalers[cl.nodeAutoscalerName()].verify(ctx, cc); err != nil {
-			return nil, fmt.Errorf("kubernetes: cluster %q: %w", cl.Name, err)
 		}
 		clients[cl.Name] = cc
 	}
@@ -126,15 +122,17 @@ func New(ctx context.Context, clusters []ClusterConfig, clients map[string]clust
 		if api := clients[cl.Name].ec2; api != nil {
 			families = inRegion(ctx, cl, api, families)
 		}
-		p.clusters[cl.Region] = cluster{
-			cfg: cl, clients: clients[cl.Name], nodeAutoscaler: nodeAutoscalers[cl.nodeAutoscalerName()],
-			families: families,
+		c := cluster{
+			cfg: cl, clients: clients[cl.Name], families: families,
+			nodeTypes: nodeInstanceTypes(cat.Offerings(clusterCatalogs[cl.Provider]), families),
 		}
+		c.clients.nodes.sizes = instanceSizes(ctx, cl, c.clients.nodes, c.nodeTypes)
+		p.clusters[cl.Region] = c
 		p.order = append(p.order, cl.Region)
-		for accel, fs := range families {
-			for _, f := range fs {
-				if !slices.Contains(p.offered[accel], f) {
-					p.offered[accel] = append(p.offered[accel], f)
+		for shape, ts := range c.nodeTypes {
+			for _, t := range ts {
+				if !slices.Contains(p.offered[shape], t) {
+					p.offered[shape] = append(p.offered[shape], t)
 				}
 			}
 		}
@@ -194,9 +192,9 @@ func (p *Provider) Name() string { return provider.ProviderKubernetes }
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
 		SupportsStop:         false,
-		SupportsSpot:         true,  // Karpenter's capacity type, see nodeAffinity
+		SupportsSpot:         true,  // the node's own launch, see managedNodes.ensure
 		SupportsEgressPolicy: false, // no NetworkPolicy is written yet
-		SupportsCPUOnly:      true,
+		SupportsCPUOnly:      false, // the catalog sizes GPU nodes only
 		NativeTags:           true,
 		PreemptionNotice:     spotNotice,
 		PollInterval:         pollInterval,
@@ -206,13 +204,13 @@ func (p *Provider) Capabilities() provider.Capabilities {
 // Offerings implements provider.Provider. There is no price table: see the package doc.
 func (p *Provider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
 
-// MapAccelerator implements provider.Provider: the families of every cluster that has the
-// accelerator. A cluster that lacks it fails its own Provision with ErrUnsupportedAccelerator
-// (see familiesFor), which blocks only that cluster. The ids are instance families, and count is
-// ignored: Karpenter picks the size, which is what lets several pods pack onto one node.
-func (p *Provider) MapAccelerator(canonical string, _ int32) ([]string, bool) {
-	fs, ok := p.offered[strings.ToUpper(canonical)]
-	return slices.Clone(fs), ok
+// MapAccelerator implements provider.Provider: the instance types, across every cluster, that
+// carry exactly count of the accelerator, since each pod gets a node of its own size. A cluster
+// that lacks them fails its own Provision with ErrUnsupportedAccelerator (see ensureNode), which
+// blocks only that cluster.
+func (p *Provider) MapAccelerator(canonical string, count int32) ([]string, bool) {
+	ts, ok := p.offered[nodeTypeKey(canonical, count)]
+	return slices.Clone(ts), ok
 }
 
 // ServesAcceleratorIn implements provider.RegionAccelerators: whether the cluster in region
@@ -226,9 +224,9 @@ func (p *Provider) ServesAcceleratorIn(canonical, region string) bool {
 	return ok
 }
 
-// Provision implements provider.Provider: create the real pod in the cluster req.Region
-// names, then wait for capacity. A pod that gets none is deleted before returning, or
-// Karpenter would launch a node for it later.
+// Provision implements provider.Provider: launch the pod's node in the cluster req.Region names,
+// then create the real pod pinned to it. The node is the capacity, so the result is reserved
+// and a shortage fails here.
 func (p *Provider) Provision(
 	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
 ) (provider.ProvisionResult, error) {
@@ -246,13 +244,13 @@ func (p *Provider) Provision(
 	if !ok {
 		return provider.ProvisionResult{}, fmt.Errorf("kubernetes: no cluster in region %q", req.Region)
 	}
-	families, err := familiesFor(cl, pod)
+	nodeName, err := ensureNode(ctx, cl, pod, req)
 	if err != nil {
 		return provider.ProvisionResult{}, err
 	}
 	real := buildPod(pod, podSpec{
 		claim:      req.ClaimName,
-		selection:  cl.nodeAutoscaler.selection(families, req.CapacityType),
+		selection:  cl.clients.nodes.selection(nodeName),
 		env:        req.Env.Config,
 		hasSecrets: len(req.Env.Secrets) > 0,
 		costLabels: p.costLabels,
@@ -260,53 +258,94 @@ func (p *Provider) Provision(
 	kube := cl.clients.kube
 
 	if err := ensureNamespace(ctx, kube, real.Namespace); err != nil {
+		cleanup(ctx, cl, "", "", req.ClaimName)
 		return provider.ProvisionResult{}, err
 	}
 	created, adopted, err := createOrAdopt(ctx, cl.clients, real)
 	if err != nil {
+		cleanup(ctx, cl, "", "", req.ClaimName) // no pod of ours, but a launched node
 		return provider.ProvisionResult{}, err
 	}
 	if len(req.Env.Secrets) > 0 {
 		if err := ensureEnvSecret(ctx, kube, created, adopted, req.Env.Secrets); err != nil {
-			cleanup(ctx, cl.clients, real.Namespace, real.Name)
+			cleanup(ctx, cl, real.Namespace, real.Name, req.ClaimName)
 			return provider.ProvisionResult{}, err
 		}
 	}
-	// Unbound is accepted, not reserved: a node may still be coming. List settles it (see
-	// toInstance), so no worker waits on Karpenter here.
 	return provider.ProvisionResult{
 		InstanceID: instanceID(req.Region, real.Namespace, real.Name),
-		Reserved:   created.Spec.NodeName != "",
+		Reserved:   true,
 	}, nil
 }
 
-// cleanup deletes a pod Provision could not finish setting up, on a context that outlives the
-// caller's.
-// A failure is only logged: the Pod fails regardless, and the NodeClaim teardown finds the
-// leftover through FindByClaim.
-func cleanup(ctx context.Context, cc clusterClients, namespace, name string) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-	defer cancel()
-	if err := deleteInstance(ctx, cc, namespace, name); err != nil {
-		logf.FromContext(ctx).Error(err, "kubernetes: could not delete a half-set-up pod; teardown will retry",
-			"namespace", namespace, "pod", name)
+// instanceSizes reads the CPU and memory of every type in nodeTypes, logging and returning nil
+// on failure so a lost read never rules a type out.
+func instanceSizes(
+	ctx context.Context, cl ClusterConfig, nodes *managedNodes, nodeTypes map[string][]string,
+) map[string]aws.InstanceResources {
+	var all []string
+	for _, ts := range nodeTypes {
+		all = append(all, ts...)
 	}
+	if len(all) == 0 {
+		return nil
+	}
+	sizes, err := nodes.ec2.InstanceTypes(ctx, all)
+	if err != nil {
+		logf.FromContext(ctx).Info("kubernetes: could not read instance type sizes; not filtering by CPU or memory",
+			"cluster", cl.Name, "error", err.Error())
+		return nil
+	}
+	return sizes
 }
 
-// familiesFor resolves the Pod's accelerator to cl's instance families; a CPU-only Pod gets none.
-func familiesFor(cl cluster, pod *corev1.Pod) ([]string, error) {
+// ensureNode launches, or adopts, the managed node for req's pod, sized to it exactly.
+func ensureNode(ctx context.Context, cl cluster, pod *corev1.Pod, req provider.ProvisionRequest) (string, error) {
 	canonical, count, err := util.AcceleratorRequest(pod)
 	if err != nil {
-		return nil, fmt.Errorf("kubernetes: %w", err)
+		return "", fmt.Errorf("kubernetes: %w", err)
 	}
 	if canonical == "" || count <= 0 {
-		return nil, nil
+		// The catalog sizes GPU instances only, so this cluster cannot serve CPU-only pods.
+		return "", fmt.Errorf("kubernetes: managed nodes serve GPU pods only: %w", provider.ErrUnsupportedAccelerator)
 	}
-	fs, ok := cl.families[strings.ToUpper(canonical)]
-	if !ok {
-		return nil, fmt.Errorf("kubernetes: unsupported accelerator %q: %w", canonical, provider.ErrUnsupportedAccelerator)
+	instanceTypes := cl.nodeTypes[nodeTypeKey(canonical, count)]
+	if len(instanceTypes) == 0 {
+		return "", fmt.Errorf("kubernetes: no instance type with %d %s: %w",
+			count, canonical, provider.ErrUnsupportedAccelerator)
 	}
-	return fs, nil
+	requests, _ := util.PodResources(pod)
+	if instanceTypes = cl.clients.nodes.fitting(instanceTypes, requests); len(instanceTypes) == 0 {
+		// The pod's own request, not the candidate's capacity: unlabelled, so nothing is blocked.
+		return "", fmt.Errorf("kubernetes: no %d×%s instance type holds %.1f vCPU and %d MiB",
+			count, canonical, requests.CPU, requests.MemoryMiB)
+	}
+	return cl.clients.nodes.ensure(ctx, nodeRequest{
+		claim:         req.ClaimName,
+		namespace:     pod.Namespace,
+		instanceTypes: instanceTypes,
+		spot:          req.CapacityType == nebulav1alpha1.CapacitySpot,
+		diskGiB:       util.PodEphemeralStorageGiB(pod),
+	})
+}
+
+// cleanup deletes what Provision could not finish setting up, the pod (when name is set) and a
+// managed cluster's node for claim, on a context that outlives the caller's.
+// A failure is only logged: the Pod fails regardless, and the NodeClaim teardown finds the
+// leftover through FindByClaim, or the node sweep does.
+func cleanup(ctx context.Context, cl cluster, namespace, name, claim string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if name != "" {
+		if err := deleteInstance(ctx, cl.clients, namespace, name); err != nil {
+			logf.FromContext(ctx).Error(err, "kubernetes: could not delete a half-set-up pod; teardown will retry",
+				"namespace", namespace, "pod", name)
+		}
+	}
+	if err := cl.clients.nodes.release(ctx, cl.clients.kube, claim); err != nil {
+		logf.FromContext(ctx).Error(err, "kubernetes: could not release a half-set-up node; the sweep will retry",
+			"claim", claim)
+	}
 }
 
 // ensureNamespace creates the Pod's namespace in a remote cluster on first use. In the host
@@ -339,7 +378,10 @@ func (p *Provider) Terminate(ctx context.Context, instanceID, _ string) error {
 	if err != nil {
 		return err
 	}
-	return deleteInstance(ctx, cl.clients, ns, name)
+	if err := deleteInstance(ctx, cl.clients, ns, name); err != nil {
+		return err
+	}
+	return cl.clients.nodes.release(ctx, cl.clients.kube, name) // the real pod is named after the claim
 }
 
 // Get implements provider.Provider.
@@ -355,7 +397,7 @@ func (p *Provider) Get(ctx context.Context, instanceID, _ string) (*provider.Ins
 	if err != nil {
 		return nil, fmt.Errorf("kubernetes: get pod %s: %w", instanceID, classifyAPI(err))
 	}
-	inst := p.toInstance(cl, pod, "")
+	inst := p.toInstance(cl, pod)
 	return &inst, nil
 }
 
@@ -373,28 +415,17 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 		if err != nil {
 			return nil, err
 		}
-		refused := p.refusals(ctx, cl, pods)
 		for i := range pods {
-			out = append(out, p.toInstance(cl, &pods[i], refused[pods[i].UID]))
+			out = append(out, p.toInstance(cl, &pods[i]))
 		}
+		// Housekeeping, not a verdict on any pod: a failure leaves the pods as listed.
+		if err := cl.clients.nodes.reconcile(ctx, cl.clients.kube); err != nil {
+			logf.FromContext(ctx).Info("kubernetes: could not cordon new nodes; retrying next poll",
+				"cluster", cl.cfg.Name, "error", err.Error())
+		}
+		cl.clients.nodes.sweep(ctx, cl.clients.kube, liveClaims(pods), p.now())
 	}
 	return out, nil
-}
-
-// refusals reads cl's node autoscaler refusals, but only while some of pods is still waiting
-// for a node: nothing else needs them. A failed read is no verdict; the bind timeout remains.
-func (p *Provider) refusals(ctx context.Context, cl cluster, pods []corev1.Pod) map[types.UID]provider.InstanceState {
-	if !slices.ContainsFunc(pods, func(pod corev1.Pod) bool { return pod.Spec.NodeName == "" }) {
-		return nil
-	}
-	// TODO: we also have performance issue here if we have many pods.
-	// Consider using informer-based caching or batching refusals requests for better performance.
-	refused, err := cl.nodeAutoscaler.refusals(ctx, cl.clients)
-	if err != nil {
-		logf.FromContext(ctx).Info("kubernetes: could not read refusals; relying on the bind timeout",
-			"cluster", cl.cfg.Name, "error", err.Error())
-	}
-	return refused
 }
 
 // FindByClaim implements provider.Provider. region names the claim's cluster; an unknown one
@@ -412,12 +443,30 @@ func (p *Provider) FindByClaim(ctx context.Context, claimName, region string) (*
 		for i := range pods {
 			// Checked again here: the selector is the server's job, and not every client honours it.
 			if pods[i].Name == claimName {
-				inst := p.toInstance(p.clusters[r], &pods[i], "")
+				inst := p.toInstance(p.clusters[r], &pods[i])
 				return &inst, nil
 			}
 		}
+		if inst, err := p.findNode(ctx, p.clusters[r], claimName); inst != nil || err != nil {
+			return inst, err
+		}
 	}
 	return nil, nil
+}
+
+// findNode reports a managed node with no real pod, which a Provision interrupted between
+// launch and create leaves: absent would tell teardown there is nothing to terminate.
+func (p *Provider) findNode(ctx context.Context, cl cluster, claim string) (*provider.Instance, error) {
+	node, err := cl.clients.nodes.ec2.Find(ctx, nodeTagKey, claim)
+	if err != nil || node == nil {
+		return nil, err
+	}
+	return &provider.Instance{
+		ID:        instanceID(cl.cfg.Region, node.Tags[nodeNamespaceTagKey], claim),
+		ClaimName: claim,
+		State:     provider.InstancePending,
+		Region:    cl.cfg.Region,
+	}, nil
 }
 
 // listPods lists this provider's pods in every namespace of cl, narrowed by fieldSelector.
@@ -589,33 +638,20 @@ func deleteInstance(ctx context.Context, cc clusterClients, namespace, name stri
 
 // toInstance normalizes a real pod. Region is the cluster's AWS region, the token the claim
 // carries.
-//
-// A pod still provisioning reports refusal ("" for none) if set, else InstanceUnschedulable
-// once it outlasts bindTimeout, timed from creation so a restart does not reset it. The
-// refusal wins so a non-capacity reason never becomes a block by waiting.
-func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refusal provider.InstanceState) provider.Instance {
-	inst := provider.Instance{
+func (p *Provider) toInstance(cl cluster, pod *corev1.Pod) provider.Instance {
+	return provider.Instance{
 		ID:        instanceID(cl.cfg.Region, pod.Namespace, pod.Name),
 		ClaimName: pod.Name,
 		State:     toState(pod),
 		Region:    cl.cfg.Region,
 		Endpoint:  pod.Status.PodIP,
 	}
-	if inst.State != provider.InstanceProvisioning {
-		return inst
-	}
-	switch {
-	case refusal != "":
-		inst.State = refusal
-	case p.now().Sub(pod.CreationTimestamp.Time) > cl.nodeAutoscaler.bindTimeout():
-		inst.State = provider.InstanceUnschedulable
-	}
-	return inst
 }
 
-// toState maps the real pod's phase. Pending splits on binding: unbound has no node behind it
-// yet. Unknown stays Pending, so a node that stopped reporting keeps the poll loop watching
-// rather than going terminal on a pod that may still run.
+// toState maps the real pod's phase. Pending covers the whole wait for its node, which exists
+// from Provision on: the readiness deadline bounds a boot that never ends. Unknown stays
+// Pending, so a node that stopped reporting keeps the poll loop watching rather than going
+// terminal on a pod that may still run.
 func toState(pod *corev1.Pod) provider.InstanceState {
 	switch pod.Status.Phase {
 	case corev1.PodRunning:
@@ -631,9 +667,6 @@ func toState(pod *corev1.Pod) provider.InstanceState {
 	case corev1.PodFailed:
 		return provider.InstanceFailed
 	default:
-		if pod.Spec.NodeName == "" {
-			return provider.InstanceProvisioning
-		}
 		return provider.InstancePending
 	}
 }

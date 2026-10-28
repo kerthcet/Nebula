@@ -142,10 +142,9 @@ func buildPod(local *corev1.Pod, s podSpec) *corev1.Pod {
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   local.Namespace,
-			Labels:      labels,
-			Annotations: s.selection.annotations,
+			Name:      name,
+			Namespace: local.Namespace,
+			Labels:    labels,
 		},
 		Spec: spec,
 	}
@@ -159,7 +158,7 @@ func withNodeRequirements(user, ours *corev1.Affinity) *corev1.Affinity {
 		return user
 	}
 	ourRequired := ours.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
-	reqs := ourRequired.NodeSelectorTerms[0].MatchExpressions
+	reqs, fields := ourRequired.NodeSelectorTerms[0].MatchExpressions, ourRequired.NodeSelectorTerms[0].MatchFields
 	if user == nil {
 		return ours
 	}
@@ -173,7 +172,9 @@ func withNodeRequirements(user, ours *corev1.Affinity) *corev1.Affinity {
 		return out
 	}
 	for i := range required.NodeSelectorTerms {
-		required.NodeSelectorTerms[i].MatchExpressions = append(required.NodeSelectorTerms[i].MatchExpressions, reqs...)
+		t := &required.NodeSelectorTerms[i]
+		t.MatchExpressions = append(t.MatchExpressions, reqs...)
+		t.MatchFields = append(t.MatchFields, fields...)
 	}
 	return out
 }

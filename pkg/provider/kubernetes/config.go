@@ -54,16 +54,19 @@ type ClusterConfig struct {
 	Region string `json:"region"`
 	// Geography is the Nebula geography the cluster counts as in (see provider.Geographies).
 	Geography string `json:"geography"`
-	// NodeAutoscaler is what adds nodes to the cluster (see nodeAutoscalers). Empty is Karpenter.
-	NodeAutoscaler string `json:"nodeAutoscaler,omitempty"`
+	// Nodes is how the nodes Nebula launches for the cluster's real pods join it.
+	Nodes *NodesConfig `json:"nodes"`
 }
 
-// nodeAutoscalerName defaults an empty NodeAutoscaler to Karpenter.
-func (c ClusterConfig) nodeAutoscalerName() string {
-	if c.NodeAutoscaler == "" {
-		return NodeAutoscalerKarpenter
-	}
-	return c.NodeAutoscaler
+// NodesConfig is how Nebula's own nodes join a cluster.
+type NodesConfig struct {
+	// InstanceProfile is the node role's instance profile, by name or ARN. The role needs an
+	// EKS access entry of type EC2_LINUX, and Nebula's identity iam:PassRole on it.
+	InstanceProfile string `json:"instanceProfile"`
+	// SubnetIDs and SecurityGroupIDs default to the cluster's own, from DescribeCluster. The
+	// subnets must reach the API server and the container registries.
+	SubnetIDs        []string `json:"subnetIDs,omitempty"`
+	SecurityGroupIDs []string `json:"securityGroupIDs,omitempty"`
 }
 
 // LoadConfig reads and validates the cluster table at path.
@@ -103,8 +106,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("kubernetes: cluster %q: unsupported provider %q (want %q)",
 				cl.Name, cl.Provider, ClusterProviderEKS)
 		}
-		if _, ok := nodeAutoscalers[cl.nodeAutoscalerName()]; !ok {
-			return fmt.Errorf("kubernetes: cluster %q: unsupported node autoscaler %q", cl.Name, cl.NodeAutoscaler)
+		if cl.Nodes == nil || cl.Nodes.InstanceProfile == "" {
+			return fmt.Errorf("kubernetes: cluster %q: nodes.instanceProfile is required", cl.Name)
 		}
 		if cl.Region == "" {
 			return fmt.Errorf("kubernetes: cluster %q: region is required", cl.Name)

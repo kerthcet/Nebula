@@ -8,4 +8,11 @@ clusters:
     provider: eks
     region: us-east-1          # the EKS cluster's AWS region
     geography: us              # set explicitly; a NodePool's regions match either this or region
-    # nodeAutoscaler: karpenter   # what adds nodes; the default and only one supported today
+    # Nebula launches one EC2 node per pod, joined with nodeadm and deleted with the pod. The
+    # node role needs an EKS access entry of type EC2_LINUX, Nebula's identity the EC2 launch
+    # permissions (ec2:DescribeInstanceTypes included) and iam:PassRole on that role, and the
+    # cluster an NVIDIA device plugin.
+    nodes:
+      instanceProfile: my-cluster-node          # the node role's instance profile
+      # subnetIDs: [subnet-a, subnet-b]         # default: the cluster's own
+      # securityGroupIDs: [sg-1]                # default: the cluster security group

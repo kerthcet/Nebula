@@ -69,9 +69,11 @@ func TestOfferedFamilies(t *testing.T) {
 // what lets placement skip a region rather than fail there. A failed lookup keeps all.
 func TestNewKeepsTheFamiliesEachRegionOffers(t *testing.T) {
 	clients := map[string]clusterClients{
-		"eks-use1": {kube: kubefake.NewClientset(), ec2: &fakeEC2{types: []string{"p5.48xlarge", "g6.xlarge"}}},
-		"eks-eun1": {kube: kubefake.NewClientset(), ec2: &fakeEC2{types: []string{"g6.xlarge"}}},
-		"eks-usw2": {kube: kubefake.NewClientset(), ec2: &fakeEC2{err: errors.New("throttled")}},
+		"eks-use1": {
+			kube: kubefake.NewClientset(), ec2: &fakeEC2{types: []string{"p5.48xlarge", "g6.xlarge"}}, nodes: testNodes(),
+		},
+		"eks-eun1": {kube: kubefake.NewClientset(), ec2: &fakeEC2{types: []string{"g6.xlarge"}}, nodes: testNodes()},
+		"eks-usw2": {kube: kubefake.NewClientset(), ec2: &fakeEC2{err: errors.New("throttled")}, nodes: testNodes()},
 	}
 	p := newTestProvider(clients)
 
@@ -98,9 +100,9 @@ func TestNewKeepsTheFamiliesEachRegionOffers(t *testing.T) {
 	}
 
 	none := newTestProvider(map[string]clusterClients{
-		"eks-use1": {kube: kubefake.NewClientset(), ec2: &fakeEC2{}},
-		"eks-eun1": {kube: kubefake.NewClientset(), ec2: &fakeEC2{}},
-		"eks-usw2": {kube: kubefake.NewClientset(), ec2: &fakeEC2{}},
+		"eks-use1": {kube: kubefake.NewClientset(), ec2: &fakeEC2{}, nodes: testNodes()},
+		"eks-eun1": {kube: kubefake.NewClientset(), ec2: &fakeEC2{}, nodes: testNodes()},
+		"eks-usw2": {kube: kubefake.NewClientset(), ec2: &fakeEC2{}, nodes: testNodes()},
 	})
 	if _, ok := none.MapAccelerator("H100", 1); ok {
 		t.Error("MapAccelerator(H100) = true with no region offering it, want false")

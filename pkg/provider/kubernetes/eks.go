@@ -30,11 +30,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
+	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8s "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+
+	"github.com/InftyAI/Nebula/pkg/provider/aws"
 )
 
 const (
@@ -57,12 +60,13 @@ const (
 )
 
 // clusterClients is what the provider needs from one cluster: pods, Secrets, namespaces and
-// events, plus discovery to check the node autoscaler is installed.
+// nodes, and the EC2 side of its nodes.
 type clusterClients struct {
 	kube k8s.Interface
 	// ec2 answers which instance families the cluster's region offers (see offeredFamilies);
 	// nil keeps every family the catalog has.
-	ec2 describeOfferings
+	ec2   describeOfferings
+	nodes *managedNodes
 }
 
 // describeOfferings is the one EC2 call used, so a test can stand in for the client.
@@ -139,7 +143,49 @@ func newEKSClients(ctx context.Context, cl ClusterConfig) (clusterClients, error
 	if err != nil {
 		return clusterClients{}, fmt.Errorf("kubernetes: cluster %q: build client: %w", cl.Name, err)
 	}
-	return clusterClients{kube: kube, ec2: ec2.NewFromConfig(awsCfg)}, nil
+	nodes, err := newManagedNodes(ctx, cl, c, aws.NewNodeLauncher(awsCfg))
+	if err != nil {
+		return clusterClients{}, err
+	}
+	return clusterClients{kube: kube, ec2: ec2.NewFromConfig(awsCfg), nodes: nodes}, nil
+}
+
+// newManagedNodes resolves, once, what every node of cl launches with: the NVIDIA AMI for the
+// cluster's Kubernetes version, and its network, defaulting to the cluster's own.
+func newManagedNodes(
+	ctx context.Context, cl ClusterConfig, c *ekstypes.Cluster, launcher *aws.NodeLauncher,
+) (*managedNodes, error) {
+	if c.Version == nil || c.KubernetesNetworkConfig == nil || c.KubernetesNetworkConfig.ServiceIpv4Cidr == nil ||
+		c.ResourcesVpcConfig == nil {
+		return nil, fmt.Errorf("kubernetes: EKS cluster %q reports no version, service CIDR or VPC", cl.Name)
+	}
+	image, err := launcher.Image(ctx, fmt.Sprintf(eksNvidiaAMI, *c.Version))
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes: cluster %q: resolve node AMI: %w", cl.Name, err)
+	}
+	subnetIDs := cl.Nodes.SubnetIDs
+	if len(subnetIDs) == 0 {
+		subnetIDs = c.ResourcesVpcConfig.SubnetIds
+	}
+	subnets, err := launcher.Subnets(ctx, subnetIDs)
+	if err != nil || len(subnets) == 0 {
+		return nil, fmt.Errorf("kubernetes: cluster %q: resolve node subnets %v: %v", cl.Name, subnetIDs, err)
+	}
+	groups := cl.Nodes.SecurityGroupIDs
+	if len(groups) == 0 && c.ResourcesVpcConfig.ClusterSecurityGroupId != nil {
+		groups = []string{*c.ResourcesVpcConfig.ClusterSecurityGroupId}
+	}
+	return &managedNodes{
+		ec2: launcher,
+		join: joinConfig{
+			cluster: cl.Name, endpoint: *c.Endpoint, ca: *c.CertificateAuthority.Data,
+			serviceCIDR: *c.KubernetesNetworkConfig.ServiceIpv4Cidr,
+		},
+		image:            image,
+		subnets:          subnets,
+		securityGroupIDs: groups,
+		instanceProfile:  cl.Nodes.InstanceProfile,
+	}, nil
 }
 
 // eksTokenSource mints and caches the bearer token for one cluster.

@@ -56,6 +56,10 @@ type ec2API interface {
 	DescribeInstanceTypeOfferings(
 		ctx context.Context, in *ec2.DescribeInstanceTypeOfferingsInput, optFns ...func(*ec2.Options),
 	) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
+	// DescribeInstanceTypes sizes a managed node's candidate types (see NodeLauncher.InstanceTypes).
+	DescribeInstanceTypes(
+		ctx context.Context, in *ec2.DescribeInstanceTypesInput, optFns ...func(*ec2.Options),
+	) (*ec2.DescribeInstanceTypesOutput, error)
 	// DescribeImages resolves the region's GPU AMI at construction (see
 	// resolveGPUAMI); DescribeSubnets discovers the default VPC's per-AZ subnets
 	// RunInstance fails over across (see discoverDefaultSubnets).
@@ -269,9 +273,43 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 	if err != nil {
 		return "", err
 	}
+	return c.launch(ctx, launchInput{
+		instanceTypes: spec.InstanceTypes,
+		spot:          spec.Spot,
+		image:         Image{ID: c.amiID, RootDevice: c.rootDevice, RootGiB: c.rootGiB},
+		diskGiB:       spec.DiskGiB,
+		subnets:       c.subnets,
+		userData:      userData,
+		tags:          spec.Tags,
+		tagKey:        ClaimTagKey,
+		templateName:  launchTemplateName(spec.Tags[ClaimTagKey]),
+	})
+}
 
+// launchInput is one instant-fleet launch. RunInstance fills it from the region's defaults
+// (default VPC, ECS GPU AMI); NodeLauncher from a cluster's network and node identity.
+type launchInput struct {
+	instanceTypes []string
+	spot          bool
+	image         Image
+	diskGiB       int
+	subnets       []subnet
+	// securityGroupIDs and instanceProfile are unset for RunInstance (see createLaunchTemplate).
+	securityGroupIDs []string
+	instanceProfile  string
+	userData         string // base64, as EC2 takes it
+	tags             map[string]string
+	// tagKey is the tag every launch of this kind carries, which the stale-template sweep
+	// keys on; templateName is stable per claim, so a retried launch reuses its template.
+	tagKey       string
+	templateName string
+}
+
+// launch runs one instant fleet over in's (instance type, subnet) grid. See RunInstance for
+// why a fleet, and how a launch with no instance is classified.
+func (c *sdkClient) launch(ctx context.Context, in launchInput) (string, error) {
 	log := logf.FromContext(ctx).WithName("aws-run").WithValues(
-		"region", c.region, "instanceTypes", spec.InstanceTypes, "spot", spec.Spot)
+		"region", c.region, "instanceTypes", in.instanceTypes, "spot", in.spot)
 
 	// Prune subnets whose AZ does not OFFER a requested type before building the grid,
 	// so we never emit a (type, subnet) override EC2 would reject outright with
@@ -280,7 +318,7 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 	// DescribeInstanceTypeOfferings failure can never shrink the grid below today's.
 	// Done BEFORE any launch template is created so a region that offers none of the
 	// requested types costs neither the template create/delete pair nor a CreateFleet.
-	offerings := c.instanceTypeAZs(ctx, spec.InstanceTypes)
+	offerings := c.instanceTypeAZs(ctx, in.instanceTypes)
 
 	// One override per (instance type, subnet) pair => EC2 searches that whole grid
 	// for capacity in a single call, landing on whichever pair is available. The
@@ -290,9 +328,9 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 	// overrides — so a template built once serves every type. No subnets (no default
 	// VPC) => one override per type with the subnet unset, letting EC2 pick it (still
 	// no cross-AZ search).
-	overrides := fleetOverrides(spec.InstanceTypes, c.subnets, offerings)
+	overrides := fleetOverrides(in.instanceTypes, in.subnets, offerings)
 	log.V(1).Info("preparing instant fleet",
-		"candidateInstanceTypes", len(spec.InstanceTypes), "candidateSubnets", len(c.subnets),
+		"candidateInstanceTypes", len(in.instanceTypes), "candidateSubnets", len(in.subnets),
 		"overrides", len(overrides))
 
 	// No override survived the prune: every requested type is offered in NO configured
@@ -305,16 +343,16 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 	if len(overrides) == 0 {
 		log.Info("skipping instant fleet: no requested type offered in any configured AZ of this region")
 		return "", wrapNoCapacity(
-			fmt.Errorf("aws: none of %v offered in any availability zone of %s", spec.InstanceTypes, c.region),
-			spec.Spot, false /* zoneLocal */)
+			fmt.Errorf("aws: none of %v offered in any availability zone of %s", in.instanceTypes, c.region),
+			in.spot, false /* zoneLocal */)
 	}
 
 	// Opportunistically reap any ephemeral launch template a prior provision leaked
 	// (crash between create and delete). Best-effort and staleness-gated, so it
 	// cannot touch a concurrent provision's own template; see sweepStaleLaunchTemplates.
-	c.sweepStaleLaunchTemplates(ctx)
+	c.sweepStaleLaunchTemplates(ctx, in.tagKey)
 
-	ltName, err := c.createLaunchTemplate(ctx, spec, userData)
+	ltName, err := c.createLaunchTemplate(ctx, in)
 	if err != nil {
 		return "", err // classifyEC2Error not needed: template creation is not a capacity path
 	}
@@ -335,7 +373,7 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 		Type: ec2types.FleetTypeInstant, // synchronous: instances/errors in the response
 		TargetCapacitySpecification: &ec2types.TargetCapacitySpecificationRequest{
 			TotalTargetCapacity:       awssdk.Int32(1),
-			DefaultTargetCapacityType: fleetCapacityType(spec.Spot),
+			DefaultTargetCapacityType: fleetCapacityType(in.spot),
 		},
 		LaunchTemplateConfigs: []ec2types.FleetLaunchTemplateConfigRequest{{
 			LaunchTemplateSpecification: &ec2types.FleetLaunchTemplateSpecificationRequest{
@@ -349,7 +387,7 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 		// A top-level error is the whole request failing (throttle, malformed, auth
 		// on the fleet API itself); classify so a capacity-shaped error still fails
 		// over correctly.
-		return "", classifyEC2Error(err, spec.Spot)
+		return "", classifyEC2Error(err, in.spot)
 	}
 
 	if id := firstFleetInstanceID(out); id != "" {
@@ -361,7 +399,7 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 	// error code back through the same classifier so a capacity shortfall carries
 	// ErrNoCapacity (and, for Spot, ErrSpotCapacity) exactly as the old per-zone
 	// sweep did, letting region/tier failover proceed.
-	err = fleetError(out, spec.Spot)
+	err = fleetError(out, in.spot)
 	log.Info("instant fleet launched no instance", "error", err.Error())
 	return "", err
 }
@@ -384,13 +422,13 @@ const staleLaunchTemplateAge = 30 * time.Minute
 // entirely best-effort: any error is logged and swallowed so a sweep hiccup never
 // fails the provision it is piggybacking on. The age gate is what keeps it safe —
 // it never touches a template young enough to belong to a concurrent provision.
-func (c *sdkClient) sweepStaleLaunchTemplates(ctx context.Context) {
+func (c *sdkClient) sweepStaleLaunchTemplates(ctx context.Context, tagKey string) {
 	log := logf.FromContext(ctx).WithName("aws-lt-sweep").WithValues("region", c.region)
 
 	in := &ec2.DescribeLaunchTemplatesInput{
 		Filters: []ec2types.Filter{{
 			Name:   awssdk.String("tag-key"),
-			Values: []string{ClaimTagKey},
+			Values: []string{tagKey},
 		}},
 	}
 	cutoff := time.Now().Add(-staleLaunchTemplateAge)
@@ -430,13 +468,13 @@ func (c *sdkClient) sweepStaleLaunchTemplates(ctx context.Context) {
 // leftover template from a crashed prior attempt collides on create, which is
 // treated as reuse rather than an error.
 //
-// SecurityGroupIds is deliberately unset: launching into a default-VPC subnet
-// attaches that VPC's default SG (outbound-open, no inbound exposure), which is
-// all a fire-and-forget container launch needs. The subnet AND the instance type
+// For RunInstance, SecurityGroupIds is deliberately unset: launching into a default-VPC
+// subnet attaches that VPC's default SG (outbound-open, no inbound exposure), which is
+// all a fire-and-forget container launch needs. A node launch sets its cluster's. The subnet AND the instance type
 // are chosen by the fleet overrides, not the template — one template serves every
 // candidate instance type — so both are intentionally absent here.
-func (c *sdkClient) createLaunchTemplate(ctx context.Context, spec InstanceSpec, userData string) (string, error) {
-	name := launchTemplateName(spec.Tags[ClaimTagKey])
+func (c *sdkClient) createLaunchTemplate(ctx context.Context, in launchInput) (string, error) {
+	name := in.templateName
 
 	// InstanceMarketOptions is deliberately NOT set here. With EC2 Fleet the Spot
 	// vs OnDemand market is selected by the fleet's DefaultTargetCapacityType (see
@@ -445,13 +483,26 @@ func (c *sdkClient) createLaunchTemplate(ctx context.Context, spec InstanceSpec,
 	// template tier-agnostic, so the stable per-claim template is safely reused when
 	// failover retries the same claim under the other tier.
 	ltData := &ec2types.RequestLaunchTemplateData{
-		ImageId:             awssdk.String(c.amiID),
-		UserData:            awssdk.String(userData),
-		BlockDeviceMappings: c.rootVolume(spec.DiskGiB),
+		ImageId:             awssdk.String(in.image.ID),
+		UserData:            awssdk.String(in.userData),
+		BlockDeviceMappings: rootVolume(in.image, in.diskGiB),
 		TagSpecifications: []ec2types.LaunchTemplateTagSpecificationRequest{{
 			ResourceType: ec2types.ResourceTypeInstance,
-			Tags:         ec2Tags(spec.Tags),
+			Tags:         ec2Tags(in.tags),
 		}},
+	}
+	if len(in.securityGroupIDs) > 0 {
+		ltData.SecurityGroupIds = in.securityGroupIDs
+	}
+	if in.instanceProfile != "" {
+		ltData.IamInstanceProfile = instanceProfileSpec(in.instanceProfile)
+		// A node's role is what its Pods would steal: IMDSv2 only, and one hop, so a Pod in
+		// its own network namespace cannot reach the token endpoint.
+		ltData.MetadataOptions = &ec2types.LaunchTemplateInstanceMetadataOptionsRequest{
+			HttpTokens:              ec2types.LaunchTemplateHttpTokensStateRequired,
+			HttpPutResponseHopLimit: awssdk.Int32(1),
+			HttpEndpoint:            ec2types.LaunchTemplateInstanceMetadataEndpointStateEnabled,
+		}
 	}
 
 	_, err := c.ec2.CreateLaunchTemplate(ctx, &ec2.CreateLaunchTemplateInput{
@@ -461,7 +512,7 @@ func (c *sdkClient) createLaunchTemplate(ctx context.Context, spec InstanceSpec,
 		// between create and delete) is identifiable for an out-of-band sweep.
 		TagSpecifications: []ec2types.TagSpecification{{
 			ResourceType: ec2types.ResourceTypeLaunchTemplate,
-			Tags:         ec2Tags(spec.Tags),
+			Tags:         ec2Tags(in.tags),
 		}},
 	})
 	if err != nil {
@@ -674,11 +725,11 @@ func rootDeviceOf(img ec2types.Image) (device string, sizeGiB int) {
 // snapshot if larger, which EC2 requires) plus diskGiB of user space for the pulled image and
 // the workload's writes. Always sent, even for 0, so the type is gp3, the one PricePerHour
 // charges for; the AMI's own root is gp2.
-func (c *sdkClient) rootVolume(diskGiB int) []ec2types.LaunchTemplateBlockDeviceMappingRequest {
+func rootVolume(img Image, diskGiB int) []ec2types.LaunchTemplateBlockDeviceMappingRequest {
 	return []ec2types.LaunchTemplateBlockDeviceMappingRequest{{
-		DeviceName: awssdk.String(c.rootDevice),
+		DeviceName: awssdk.String(img.RootDevice),
 		Ebs: &ec2types.LaunchTemplateEbsBlockDeviceRequest{
-			VolumeSize:          awssdk.Int32(int32(max(awsAMIRootGiB, c.rootGiB) + diskGiB)),
+			VolumeSize:          awssdk.Int32(int32(max(awsAMIRootGiB, img.RootGiB) + diskGiB)),
 			VolumeType:          ec2types.VolumeTypeGp3,
 			DeleteOnTermination: awssdk.Bool(true),
 		},
